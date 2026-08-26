@@ -106,6 +106,7 @@ export const LANGUAGES = [
   'r',
   'solidity',
   'nix',
+  'systemverilog',
   'yaml',
   'twig',
   'xml',

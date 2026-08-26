@@ -999,7 +999,7 @@ export class TreeSitterExtractor {
     // Check for function declarations
     // For Python/Ruby, function_definition inside a class should be treated as method
     if (this.extractor.functionTypes.includes(nodeType)) {
-      if (this.isInsideClassLikeNode() && this.extractor.methodTypes.includes(nodeType)) {
+      if (this.isInsideMethodScope() && this.extractor.methodTypes.includes(nodeType)) {
         // Inside a class - treat as method
         this.extractMethod(node);
         skipChildren = true; // extractMethod visits children via visitFunctionBody
@@ -1513,6 +1513,7 @@ export class TreeSitterExtractor {
   }
 
   /**
+/**
    * Ruby `CONST = …` assignment whose LHS is a `constant` node — a class/module
    * (or top-level) constant worth extracting as a symbol even inside a class.
    * Other languages don't give an assignment a `constant`-typed LHS, so this
@@ -1522,6 +1523,29 @@ export class TreeSitterExtractor {
     if (node.type !== 'assignment') return false;
     const left = getChildByField(node, 'left') ?? node.namedChild(0);
     return left?.type === 'constant';
+  }
+
+  /**
+   * Whether the immediate enclosing scope is one of the given node kinds.
+   * Narrower than isInsideClassLikeNode — lets a language scope method
+   * classification to true OO containers only.
+   */
+  private isInsideScopeKinds(kinds: readonly NodeKind[]): boolean {
+    const parentId = this.nodeStack[this.nodeStack.length - 1];
+    if (!parentId) return false;
+    const parentNode = this.nodes.find((n) => n.id === parentId);
+    return !!parentNode && kinds.includes(parentNode.kind);
+  }
+
+  /**
+   * The scope test gating method-vs-function classification. Defaults to the
+   * broad class-like check; a language can narrow it via methodScopeKinds
+   * (SystemVerilog limits 'method' to `class` scope so module-level
+   * subroutines stay 'function').
+   */
+  private isInsideMethodScope(): boolean {
+    const kinds = this.extractor?.methodScopeKinds;
+    return kinds ? this.isInsideScopeKinds(kinds) : this.isInsideClassLikeNode();
   }
 
   /**
@@ -1757,7 +1781,7 @@ export class TreeSitterExtractor {
     // For most languages, only extract as method if inside a class-like node
     // Languages with methodsAreTopLevel (e.g. Go) always treat them as methods
     // Languages with getReceiverType (e.g. Rust) extract as method when receiver is found
-    if (!this.isInsideClassLikeNode() && !this.extractor.methodsAreTopLevel && !receiverType) {
+    if (!this.isInsideMethodScope() && !this.extractor.methodsAreTopLevel && !receiverType) {
       // Skip method_definition nodes inside object literals (getters/setters/methods
       // in inline objects). These are ephemeral and create noise (e.g., Svelte context
       // objects: `ctx.set({ get view() { ... } })`).
@@ -5477,6 +5501,32 @@ export class TreeSitterExtractor {
               column: target.startPosition.column,
             });
           }
+        }
+      }
+
+      // SystemVerilog: `class D extends pkg::Base #(P);` carries the superclass as
+      // a `class_type` child (no extends_clause node). The direct simple_identifiers
+      // are the scope path (`pkg`, `Base`); the parameter_value_assignment (#(...))
+      // is a sibling that's ignored. Emit the full scoped name `pkg::Base` so the
+      // resolver's qualified-name match can disambiguate same-named base classes in
+      // different packages; an unqualified `extends Base` stays `Base` and resolves
+      // by name + the inheritance kind bias.
+      if (this.language === 'systemverilog' && child.type === 'class_type') {
+        const ids = child.namedChildren.filter(
+          (c: SyntaxNode) => c.type === 'simple_identifier'
+        );
+        const base = ids[ids.length - 1];
+        if (base) {
+          const scopedName = ids
+            .map((id) => getNodeText(id, this.source).trim())
+            .join('::');
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: scopedName,
+            referenceKind: 'extends',
+            line: base.startPosition.row + 1,
+            column: base.startPosition.column,
+          });
         }
       }
 
