@@ -6957,6 +6957,10 @@ export class ToolHandler {
     if (edge.kind === 'instantiates') return 'instantiation';
     if (edge.kind === 'imports') return 'import';
     if (edge.kind === 'references') return 'reference';
+    // A `drives` caller is a MODULE, and a module spans the whole file — its
+    // own startLine locates nothing. The write site is the answer, so it rides
+    // in the label rather than being dropped.
+    if (edge.kind === 'drives') return edge.line ? `drives at line ${edge.line}` : 'drives';
     return edge.kind;
   }
 

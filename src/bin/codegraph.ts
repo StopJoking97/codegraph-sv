@@ -1965,7 +1965,10 @@ program
       }
 
       const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
+      // `driveLine` is the write site of a `drives` edge. A driven net's caller is
+      // the enclosing MODULE, which spans the whole file, so its own startLine
+      // locates nothing — the assign/always line is what was actually asked for.
+      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number; driveLine?: number }> = [];
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
@@ -1973,7 +1976,8 @@ program
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine,
+              driveLine: c.edge.kind === 'drives' ? c.edge.line : undefined });
           }
         }
       }
@@ -1983,7 +1987,8 @@ program
         for (const c of cg.getCallers(matches[0].node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
+            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine,
+              driveLine: c.edge.kind === 'drives' ? c.edge.line : undefined });
           }
         }
       }
@@ -1997,12 +2002,12 @@ program
       } else {
         console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
         for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
+          const loc = node.driveLine ? `:${node.driveLine}` : node.startLine ? `:${node.startLine}` : '';
           console.log(
             chalk.cyan(node.kind.padEnd(12)) +
             chalk.white(node.name)
           );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
+          console.log(chalk.dim(`  ${node.filePath}${loc}${node.driveLine ? '  (drives)' : ''}`));
           console.log();
         }
       }
