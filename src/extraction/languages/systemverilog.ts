@@ -439,15 +439,104 @@ function emitSignalNodes(
  * "nothing found". Replacement preserves byte offsets (directive text ->
  * spaces, newlines kept) so every symbol's line/column stays exact.
  *
+ * Only the directive TOKEN and its macro argument are blanked, NEVER the rest
+ * of the line. Vendor models put live code after a directive on the same line:
+ * a multi-line `if` condition that closes with "`endif  ) &&" is real, and
+ * blanking to end-of-line ate the `) &&`, corrupting the expression and
+ * killing every driver in the enclosing always block (seen on a vendor
+ * memory model).
+ *
  * `define / `include / `timescale and macro USES are left alone -- the grammar
  * parses those.
  */
 export function blankVerilogConditionalDirectives(source: string): string {
   if (source.indexOf('`') === -1) return source;
-  const re = /^([ \t]*)`(?:ifndef|ifdef|elsif|else|endif)\b[^\r\n]*/gm;
-  return source.replace(re, (m: string, indent: string) => indent + ' '.repeat(m.length - indent.length));
+  const blank = (m: string) => ' '.repeat(m.length);
+  return (
+    source
+      // `ifdef FOO / `ifndef FOO / `elsif FOO -- directive plus its macro name.
+      .replace(/^[ \t]*`(?:ifndef|ifdef|elsif)[ \t]+[A-Za-z_]\w*/gm, blank)
+      // `else / `endif take no argument.
+      .replace(/^[ \t]*`(?:else|endif)\b/gm, blank)
+  );
 }
 
+
+// -- Drivers: who writes this net ---------------------------------------------
+//
+// "Where is rstn_sync declared" is answered by the signal nodes above; "what
+// DRIVES it" is the other half of the same question, and the one an engineer
+// asks when a net is stuck at the wrong value. The driver is the continuous
+// assign or the always block that writes the signal, so the edge runs from the
+// enclosing module to the signal, carrying the assignment's own line/column.
+//
+// Binding is deliberately MODULE-SCOPED, not name-matched: RTL reuses signal
+// names ruthlessly (`cnt`, `valid`, `state` exist in a dozen modules), and a
+// drive edge bound to the wrong module's `cnt` is worse than no edge at all.
+// So the extractor emits a marker the generic resolver ignores, and the SV
+// post-pass binds it against the module's own contained signals. A driven name
+// the module does not declare -- an implicit net, or a testbench hierarchical
+// reference like `dut.core.rstn` -- binds to nothing and is dropped.
+const SV_DRIVE_PREFIX = '__sv_drive__';
+
+/** Lvalue wrappers that can nest (concatenation targets: `{c, x} = din;`). */
+const LVALUE_WRAPPERS = new Set(['net_lvalue', 'variable_lvalue']);
+
+/**
+ * Identifiers actually DRIVEN by an lvalue.
+ *
+ * Three shapes have to be told apart, and two of them are traps:
+ *   - a concatenation lvalue nests further lvalues, so it must recurse or the
+ *     driven names come back as the literal text `{c, x}`
+ *   - a bit/part select (`dout[idx]`) hangs the index under a `constant_select`
+ *     / `select` sibling, whose identifiers are READ, never driven -- so those
+ *     subtrees are skipped rather than walked
+ *   - `variable_lvalue` always nests its identifier under a
+ *     `hierarchical_identifier`; `net_lvalue` never does
+ *
+ * A hierarchical reference with more than one segment (`dut.core.rstn`) is
+ * skipped: its target lives in another module, which module-scoped binding
+ * cannot reach, and guessing by last segment would invent edges.
+ */
+function collectDrivenIds(node: SyntaxNode, out: SyntaxNode[], depth = 0): void {
+  if (depth > 8) return; // concat nesting is shallow in practice; bound the walk
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const c = node.namedChild(i);
+    if (!c) continue;
+    if (c.type === 'simple_identifier') {
+      out.push(c);
+    } else if (LVALUE_WRAPPERS.has(c.type)) {
+      collectDrivenIds(c, out, depth + 1);
+    } else if (c.type === 'hierarchical_identifier') {
+      const ids = childrenOfType(c, 'simple_identifier');
+      if (ids.length === 1 && ids[0]) out.push(ids[0]);
+    }
+    // Anything else (constant_select, select, expression) is index or
+    // right-hand-side material: read, not driven.
+  }
+}
+
+/** Emit one drive marker per identifier the lvalue writes, at the site's position. */
+function emitDriveMarkers(lvalue: SyntaxNode, site: SyntaxNode, ctx: ExtractorContext): void {
+  const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (!fromId) return;
+  const ids: SyntaxNode[] = [];
+  collectDrivenIds(lvalue, ids);
+  if (ids.length === 0) return;
+  const line = site.startPosition.row + 1;
+  const column = site.startPosition.column;
+  for (const id of ids) {
+    const name = getNodeText(id, ctx.source).trim();
+    if (!name) continue;
+    ctx.addUnresolvedReference({
+      fromNodeId: fromId,
+      referenceName: `${SV_DRIVE_PREFIX}${name}`,
+      referenceKind: 'drives',
+      line,
+      column,
+    });
+  }
+}
 
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
@@ -757,6 +846,14 @@ export const systemverilogExtractor: LanguageExtractor = {
       }
       const netType = childrenOfType(node, 'net_type')[0];
       emitSignalNodes(ids, node, 'field', netType ? getNodeText(netType, ctx.source).trim() : 'net', ctx);
+      // `wire drv = a & b;` declares AND drives: the assignment node carries an
+      // expression child alongside the identifier.
+      if (list) {
+        for (const a of childrenOfType(list, 'net_decl_assignment')) {
+          const id = childrenOfType(a, 'simple_identifier')[0];
+          if (id && a.namedChildCount > 1) emitDriveMarkers(a, a, ctx);
+        }
+      }
       return false;
     }
 
@@ -791,6 +888,41 @@ export const systemverilogExtractor: LanguageExtractor = {
       }
       const decorator = t === 'local_parameter_declaration' ? 'localparam' : 'parameter';
       emitSignalNodes(ids, node, 'constant', decorator, ctx);
+      return false;
+    }
+
+    // Continuous assign: `assign y = a & b;` — the module drives y.
+    if (t === 'continuous_assign') {
+      const list = childrenOfType(node, 'list_of_net_assignments')[0];
+      const assigns = list
+        ? childrenOfType(list, 'net_assignment')
+        : childrenOfType(node, 'net_assignment');
+      for (const a of assigns) {
+        const lv = childrenOfType(a, 'net_lvalue')[0];
+        if (lv) emitDriveMarkers(lv, a, ctx);
+      }
+      return false; // keep walking: the right-hand side can contain calls
+    }
+
+    // Sequential driver: `q <= d;` inside always_ff / always @(posedge clk).
+    // Matched unanchored — the statement nesting between the always keyword and
+    // the assignment differs between the begin/end and single-statement forms,
+    // so any fixed-depth path would miss half of them.
+    if (t === 'nonblocking_assignment') {
+      const lv = childrenOfType(node, 'variable_lvalue')[0];
+      if (lv) emitDriveMarkers(lv, node, ctx);
+      return false;
+    }
+
+    // Combinational driver: `p = a;` inside always_comb / always @(*) / initial.
+    // The `operator_assignment` layer is mandatory — a variable_lvalue is never
+    // a direct child of blocking_assignment.
+    if (t === 'blocking_assignment') {
+      const op = childrenOfType(node, 'operator_assignment')[0];
+      const lv = op
+        ? childrenOfType(op, 'variable_lvalue')[0]
+        : childrenOfType(node, 'variable_lvalue')[0];
+      if (lv) emitDriveMarkers(lv, node, ctx);
       return false;
     }
 

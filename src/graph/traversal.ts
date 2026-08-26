@@ -292,7 +292,12 @@ export class GraphTraverser {
     // caller of the class. Without it, `callers <Class>` surfaced only the
     // importing file (via `imports`) and missed every construction site —
     // the opposite of "what breaks if I change this class?" (#774).
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
+    // `drives` counts as a caller for the same reason: in RTL, "what drives
+    // this net" IS the callers question — the assign/always block that writes
+    // it. Deliberately NOT added to getCallees below: a module drives hundreds
+    // of signals, and flooding its callee list would bury the instantiation
+    // hierarchy that makes a module's callees worth reading.
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'drives']);
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one

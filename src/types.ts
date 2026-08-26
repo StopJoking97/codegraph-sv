@@ -67,6 +67,7 @@ export const EDGE_KINDS = [
   'instantiates',    // Creates instance of class
   'overrides',       // Method overrides parent method
   'decorates',       // Decorator applied to symbol
+  'drives',          // HDL: a scope drives a signal (assign / always target)
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];

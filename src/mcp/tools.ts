@@ -383,7 +383,7 @@ const ISOLATED_WEAK_KIND_WEIGHT = 0.08;
  */
 const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
   'calls', 'references', 'extends', 'implements', 'overrides',
-  'instantiates', 'returns', 'type_of', 'decorates',
+  'instantiates', 'returns', 'type_of', 'decorates', 'drives',
 ]);
 
 /**

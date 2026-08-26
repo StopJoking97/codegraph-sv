@@ -998,3 +998,167 @@ endmodule
     expect(blankVerilogConditionalDirectives(src)).toBe(src);
   });
 });
+
+describe('SystemVerilog driver edges (what writes this net)', () => {
+  /** name@line for every drive marker the extractor emits. */
+  const drives = (code: string, file = 'drv.v') =>
+    extractFromSource(file, code)
+      .unresolvedReferences.filter((r) => r.referenceKind === 'drives')
+      .map((r) => `${r.referenceName.replace('__sv_drive__', '')}@${r.line}`);
+
+  it('captures all four writer shapes', () => {
+    const code = `
+module core(input clk, input a, input b, output reg [3:0] q, output y);
+  wire [3:0] cnt;
+  reg  [3:0] nxt;
+  wire drv = a & b;
+  assign y = a | b;
+  always @(posedge clk) begin
+    nxt <= cnt;
+  end
+  always @(*) begin
+    q = nxt;
+  end
+endmodule
+`;
+    expect(drives(code)).toEqual([
+      'drv@5', // inline net-declaration driver
+      'y@6',   // continuous assign
+      'nxt@8', // nonblocking, inside always @(posedge)
+      'q@11',  // blocking, inside always @(*)
+    ]);
+  });
+
+  it('recurses into a concatenation lvalue and ignores the bit-select index', () => {
+    // `{q[3], q[2]} = cnt[1:0]` drives q twice. A flat read would yield the
+    // literal text `{q[3], q[2]}`; walking the index expression would wrongly
+    // report cnt (which is READ) as driven.
+    const code = `
+module m(output reg [3:0] q);
+  wire [3:0] cnt;
+  assign {q[3], q[2]} = cnt[1:0];
+endmodule
+`;
+    expect(drives(code)).toEqual(['q@4', 'q@4']);
+  });
+
+  it('does not treat a less-than-or-equal comparison as a driver', () => {
+    // `a <= b` inside a condition is a comparison, not a nonblocking assignment.
+    const code = `
+module m(input [3:0] a, input [3:0] b, output reg hit);
+  always @(*) begin
+    if (a <= b) hit = 1'b1;
+    else        hit = 1'b0;
+  end
+endmodule
+`;
+    expect(drives(code)).toEqual(['hit@4', 'hit@5']);
+  });
+});
+
+describe('SystemVerilog driver edges — module-scoped binding', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-drives-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  /** `<driverName>@L<line>` for every drives edge into the named signal in `file`. */
+  function driversOf(graph: CodeGraph, signal: string, file: string): string[] {
+    const node = graph
+      .getNodesByKind('field')
+      .find((n) => n.name === signal && n.filePath === file);
+    expect(node, `signal ${signal} in ${file}`).toBeDefined();
+    return graph
+      .getCallers(node!.id)
+      .filter((c) => c.edge.kind === 'drives')
+      .map((c) => `${c.node.name}@L${c.edge.line}`)
+      .sort();
+  }
+
+  it('binds a drive to the writing module, never to a same-named net elsewhere', async () => {
+    // `nxt` and `cnt` exist in BOTH modules. Global name matching would happily
+    // cross-bind them; Verilog scope says a procedural assignment can only
+    // write a signal declared in its own module.
+    cg = await indexFiles({
+      'core.v': `
+module core(input clk, output reg [3:0] nxt);
+  wire [3:0] cnt;
+  always @(posedge clk) nxt <= cnt;
+endmodule
+`,
+      'other.v': `
+module other(input clk, output reg [3:0] nxt);
+  wire [3:0] cnt;
+  always @(posedge clk) nxt <= cnt;
+endmodule
+`,
+    });
+    expect(driversOf(cg, 'nxt', 'core.v')).toEqual(['core@L4']);
+    expect(driversOf(cg, 'nxt', 'other.v')).toEqual(['other@L4']);
+  });
+
+  it('keeps every write site as its own edge, and leaves input ports undriven', async () => {
+    cg = await indexFiles({
+      'multi.v': `
+module multi(input clk, input sel, output reg y);
+  always @(*) begin
+    if (sel) y = 1'b1;
+    else     y = 1'b0;
+  end
+endmodule
+`,
+    });
+    const y = cg.getNodesByKind('field').find((n) => n.name === 'y' && n.filePath === 'multi.v');
+    expect(y).toBeDefined();
+
+    // Both write sites survive as distinct edges — a multi-driven net is a real
+    // RTL bug class, so losing a site would hide it.
+    const sites = cg
+      .getIncomingEdges(y!.id)
+      .filter((e) => e.kind === 'drives')
+      .map((e) => e.line)
+      .sort();
+    expect(sites).toEqual([4, 5]);
+
+    // getCallers collapses one caller reached by several edges (#1086), so the
+    // driving MODULE is reported once. That is the callers contract, not a
+    // dropped edge — the site list above is where the per-line detail lives.
+    expect(driversOf(cg, 'y', 'multi.v')).toEqual(['multi@L4']);
+
+    expect(driversOf(cg, 'clk', 'multi.v')).toEqual([]);
+    expect(driversOf(cg, 'sel', 'multi.v')).toEqual([]);
+  });
+
+  it('drops a hierarchical write rather than guessing a local signal of the same name', async () => {
+    // A testbench writing `dut.rstn` must NOT produce an edge to the
+    // testbench's own `rstn` — that would be an invented fact.
+    cg = await indexFiles({
+      'tb.sv': `
+module tb;
+  reg rstn;
+  initial begin
+    dut.rstn = 1'b0;
+  end
+endmodule
+`,
+    });
+    expect(driversOf(cg, 'rstn', 'tb.sv')).toEqual([]);
+  });
+});

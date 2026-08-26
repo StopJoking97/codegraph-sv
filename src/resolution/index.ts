@@ -1610,6 +1610,79 @@ export class ReferenceResolver {
   }
 
   /**
+   * Bind the SystemVerilog drive markers (`__sv_drive__<signal>`) the extractor
+   * emits for every continuous assign, nonblocking and blocking assignment, and
+   * inline net-declaration driver. Returns the number of `drives` edges created.
+   *
+   * Binding is MODULE-SCOPED on purpose. RTL reuses signal names across the
+   * whole design (`cnt`, `valid`, `rstn_sync` each exist in several modules), so
+   * the generic name-matcher would happily bind a drive to another module's
+   * same-named net. Instead each marker is resolved against the `contains`
+   * children of the scope that emitted it, which is exactly the Verilog rule:
+   * a procedural or continuous assignment can only write a signal declared in
+   * its own module.
+   *
+   * A marker that matches nothing is DROPPED, not guessed: it is either an
+   * implicit net (never declared, so there is no node to point at) or a
+   * testbench hierarchical write like `dut.core.rstn`, whose target lives in
+   * another module. Silent beats wrong.
+   */
+  resolveSvDriveEdges(): number {
+    const PREFIX = '__sv_drive__'; // mirrors SV_DRIVE_PREFIX in the extractor
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'drives' && ref.referenceName.startsWith(PREFIX));
+    if (candidates.length === 0) return 0;
+
+    const edges: Edge[] = [];
+    // One `contains` walk per scope, not per marker: a large module emits
+    // hundreds of drives and would otherwise re-read its own member list
+    // hundreds of times.
+    const membersByScope = new Map<string, Map<string, string>>();
+    // Delete keys are (from, name, kind) — one key covers every site of the
+    // same signal, so dedupe before deleting.
+    const deleteKeys = new Map<
+      string,
+      { fromNodeId: string; referenceName: string; referenceKind: string }
+    >();
+
+    for (const ref of candidates) {
+      deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
+        fromNodeId: ref.fromNodeId,
+        referenceName: ref.referenceName,
+        referenceKind: ref.referenceKind,
+      });
+
+      let members = membersByScope.get(ref.fromNodeId);
+      if (!members) {
+        members = new Map<string, string>();
+        for (const e of this.queries.getOutgoingEdges(ref.fromNodeId, ['contains'])) {
+          const child = this.queries.getNodeById(e.target);
+          if (child && (child.kind === 'field' || child.kind === 'constant')) {
+            members.set(child.name, child.id);
+          }
+        }
+        membersByScope.set(ref.fromNodeId, members);
+      }
+
+      const target = members.get(ref.referenceName.slice(PREFIX.length));
+      if (!target) continue; // implicit net or cross-module hierarchical write
+      edges.push({
+        source: ref.fromNodeId,
+        target,
+        kind: 'drives',
+        line: ref.line,
+        column: ref.column,
+        provenance: 'tree-sitter',
+      });
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    if (deleteKeys.size > 0) this.queries.deleteSpecificResolvedReferences([...deleteKeys.values()]);
+    return edges.length;
+  }
+
+  /**
    * Bind the SystemVerilog factory-create and TLM-connect markers emitted by
    * the extractor (`__sv_create__<handle>__<Type>`, `__sv_connect__<from>__<to>`).
    * Both express composition/dataflow that the generic resolver can't read, so
@@ -2256,6 +2329,8 @@ export class ReferenceResolver {
       if (svBound > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svBound;
       const svHdl = this.resolveSvHdlEdges();
       if (svHdl > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHdl;
+      const svDrv = this.resolveSvDriveEdges();
+      if (svDrv > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svDrv;
     } catch {
       // additive and optional; never fail the index on it
     }
