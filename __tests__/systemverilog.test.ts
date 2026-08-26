@@ -11,6 +11,7 @@ import * as path from 'path';
 import { extractFromSource } from '../src/extraction';
 import { detectLanguage, initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { matchReference } from '../src/resolution/name-matcher';
+import { blankVerilogConditionalDirectives } from '../src/extraction/languages/systemverilog';
 import { CodeGraph } from '../src';
 import { DatabaseConnection } from '../src/db';
 import type { Node } from '../src/types';
@@ -822,5 +823,178 @@ endclass
       .getOutgoingEdges(owner.id)
       .filter((e) => e.kind === 'references' && e.target === comp.id);
     expect(toComp).toHaveLength(1);
+  });
+});
+
+describe('SystemVerilog signal extraction (ports, nets, variables, parameters)', () => {
+  /** kind:name[decorators]@line for every signal-ish node, in extraction order. */
+  const sigs = (code: string, file = 'sig.sv') =>
+    extractFromSource(file, code)
+      .nodes.filter((n) => n.kind === 'field' || n.kind === 'constant')
+      .map((n) => `${n.kind}:${n.name}[${(n.decorators ?? []).join(',')}]@${n.startLine}`);
+
+  it('extracts ANSI ports with their direction, including direction-inheriting ports', () => {
+    // `rstn` carries NO header of its own — it inherits `input` from `clk`.
+    // Anchoring on the header child instead of the port_name field drops it.
+    const code = `
+module top (
+  input logic clk, rstn,
+  output reg [7:0] q,
+  inout wire sda
+);
+endmodule
+`;
+    expect(sigs(code)).toEqual([
+      'field:clk[input]@3',
+      'field:rstn[input]@3',
+      'field:q[output]@4',
+      'field:sda[inout]@5',
+    ]);
+  });
+
+  it('extracts non-ANSI port declarations across all three identifier-list shapes', () => {
+    // `input a, b;` -> list_of_port_identifiers, `output reg y;` ->
+    // list_of_variable_port_identifiers. Both must be accepted.
+    const code = `
+module leaf_na(a, b, y, oe);
+  input a, b;
+  output reg y;
+  inout oe;
+endmodule
+`;
+    expect(sigs(code, 'leaf_na.v')).toEqual([
+      'field:a[input]@3',
+      'field:b[input]@3',
+      'field:y[output]@4',
+      'field:oe[inout]@5',
+    ]);
+  });
+
+  it('extracts nets and variables, keeping every declarator of a multi-declarator line', () => {
+    // `reg`/`logic`/`bit` are data_declaration, NOT net_declaration — treating
+    // them as nets extracts nothing.
+    const code = `
+module m;
+  wire [3:0] cnt, cnt2;
+  reg valid;
+  logic [31:0] data_q;
+  bit flag;
+endmodule
+`;
+    expect(sigs(code)).toEqual([
+      'field:cnt[wire]@3',
+      'field:cnt2[wire]@3',
+      'field:valid[reg]@4',
+      'field:data_q[logic]@5',
+      'field:flag[bit]@6',
+    ]);
+  });
+
+  it('extracts parameters and localparams from both the #() port list and the body', () => {
+    // localparam is local_parameter_declaration, a DIFFERENT node type — a
+    // query on parameter_declaration alone misses every one of them.
+    const code = `
+module p #(parameter int W = 8, localparam DEPTH = 16) ();
+  localparam MAGIC = 32'hDEAD;
+  parameter LATE = 3;
+endmodule
+`;
+    expect(sigs(code)).toEqual([
+      'constant:W[parameter]@2',
+      'constant:DEPTH[localparam]@2',
+      'constant:MAGIC[localparam]@3',
+      'constant:LATE[parameter]@4',
+    ]);
+  });
+
+  it('does not double-extract a typedef as a field (type_declaration is a data_declaration)', () => {
+    const code = `
+module m;
+  typedef logic [7:0] byte_t;
+  byte_t b0;
+endmodule
+`;
+    const r = extractFromSource('td.sv', code);
+    expect(r.nodes.filter((n) => n.kind === 'type_alias').map((n) => n.name)).toEqual(['byte_t']);
+    expect(r.nodes.filter((n) => n.kind === 'field').map((n) => n.name)).toEqual(['b0']);
+  });
+
+  it('nests signals under their module (contains edge + qualified name)', () => {
+    const code = `
+module a;
+  wire w_a;
+endmodule
+module b;
+  wire w_b;
+endmodule
+`;
+    const r = extractFromSource('two.sv', code);
+    const wa = r.nodes.find((n) => n.name === 'w_a');
+    const wb = r.nodes.find((n) => n.name === 'w_b');
+    expect(wa?.qualifiedName).toContain('a');
+    expect(wb?.qualifiedName).toContain('b');
+    expect(wa?.qualifiedName).not.toBe(wb?.qualifiedName);
+  });
+
+  it('carries the declaration text as the signature', () => {
+    const code = `
+module m(rx_wdata_l);
+  output [23:00] rx_wdata_l;
+endmodule
+`;
+    const r = extractFromSource('sig2.v', code);
+    expect(r.nodes.find((n) => n.name === 'rx_wdata_l')?.signature).toBe(
+      'output [23:00] rx_wdata_l'
+    );
+  });
+});
+
+describe('SystemVerilog `ifdef handling (preParse directive blanking)', () => {
+  it('indexes BOTH branches of an `ifdef and keeps line numbers exact', () => {
+    // A common ASIC-project shape: an FPGA build uses a continuous
+    // assign, the ASIC build instantiates a cell. Both are facts about the
+    // design, and the grammar has no preprocessor to pick between them.
+    const code = `
+module clk_sel(input a, output y);
+\`ifdef FPGA
+  assign y = a;
+  wire fpga_only;
+\`else
+  BUFF u_buf(.A(a), .Z(y));
+  wire asic_only;
+\`endif
+endmodule
+`;
+    const r = extractFromSource('clk_sel.v', code);
+    const fields = r.nodes.filter((n) => n.kind === 'field');
+    // Both branches present, at their ORIGINAL line numbers.
+    expect(fields.find((n) => n.name === 'fpga_only')?.startLine).toBe(5);
+    expect(fields.find((n) => n.name === 'asic_only')?.startLine).toBe(8);
+    // The module still spans the whole file — no ERROR node truncated it.
+    const mod = r.nodes.find((n) => n.kind === 'module' && n.name === 'clk_sel');
+    expect(mod?.startLine).toBe(2);
+    expect(mod?.endLine).toBe(10);
+    // The guarded instantiation still binds.
+    expect(
+      r.unresolvedReferences.some((x) => x.referenceName === 'BUFF' && x.referenceKind === 'instantiates')
+    ).toBe(true);
+  });
+
+  it('blanks directive lines in place: same length, same line count, offsets preserved', () => {
+    const src = '`ifdef A\nwire x;\n  `endif\n';
+    const out = blankVerilogConditionalDirectives(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    expect(out).toBe('        \nwire x;\n        \n');
+  });
+
+  it('leaves `define, `include and `timescale alone', () => {
+    const src = '`timescale 1ns/1ps\n`define W 8\n`include "defs.svh"\n';
+    expect(blankVerilogConditionalDirectives(src)).toBe(src);
+  });
+
+  it('is a no-op on a file with no backtick at all', () => {
+    const src = 'module m;\nendmodule\n';
+    expect(blankVerilogConditionalDirectives(src)).toBe(src);
   });
 });

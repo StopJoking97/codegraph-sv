@@ -299,10 +299,161 @@ function isEnumTypedef(node: SyntaxNode): boolean {
   return false;
 }
 
+// -- Signals: ports, nets, variables, parameters ------------------------------
+//
+// RTL work is signal work: "where is rstn_sync declared", "what is dft_mode",
+// "which module owns cfg_mode" are the questions actually asked of a design.
+// Before this the graph had no answer at all -- SV emitted modules, classes and
+// subroutines only, so every signal-name query returned zero rows and the caller
+// fell back to grepping and reading whole files.
+//
+// NODE_KINDS has no HDL-specific kind, so the two closest are reused:
+//   ports + nets + variables  -> 'field'     (a member of the enclosing module)
+//   parameter / localparam    -> 'constant'
+// The RTL detail rides along in `decorators` (['input'] / ['wire'] / ['logic'])
+// and `signature` (the collapsed declaration text), so search output still reads
+// like RTL rather than a bare identifier.
+
+/** Non-ANSI port declarations: `input clk;` / `output reg [7:0] q;`. */
+const NONANSI_PORT_NODES = new Set([
+  'input_declaration',
+  'output_declaration',
+  'inout_declaration',
+]);
+
+/**
+ * Identifier-list wrappers under a non-ANSI port declaration. Which one appears
+ * is decided by the declared TYPE, not the direction: a net or implicit type
+ * gives list_of_port_identifiers, `output reg y` gives
+ * list_of_variable_port_identifiers, an explicit `var` gives
+ * list_of_variable_identifiers. All three hold N direct simple_identifier
+ * children, so all three must be accepted or a whole declaration style is lost.
+ */
+const PORT_ID_LIST_NODES = new Set([
+  'list_of_port_identifiers',
+  'list_of_variable_port_identifiers',
+  'list_of_variable_identifiers',
+]);
+
+/** ANSI port headers that can carry a direction keyword. */
+const PORT_HEADER_NODES = new Set([
+  'variable_port_header',
+  'net_port_header',
+  'interface_port_header',
+]);
+
+/** Direct named children of `node` with the given type. */
+function childrenOfType(node: SyntaxNode, type: string): SyntaxNode[] {
+  const out: SyntaxNode[] = [];
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const c = node.namedChild(i);
+    if (c && c.type === type) out.push(c);
+  }
+  return out;
+}
+
+/** First direct named child of `node` whose type is in `types`. */
+function firstChildOfTypes(node: SyntaxNode, types: ReadonlySet<string>): SyntaxNode | undefined {
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const c = node.namedChild(i);
+    if (c && types.has(c.type)) return c;
+  }
+  return undefined;
+}
+
+/**
+ * One-line signature for a signal declaration -- the declaration text with runs
+ * of whitespace collapsed and a long initializer trimmed, so a search hit reads
+ * `output [23:00] rx_wdata_l` instead of a bare name.
+ */
+function svDeclSignature(node: SyntaxNode, source: string): string {
+  const text = getNodeText(node, source).replace(/\s+/g, ' ').replace(/\s*;$/, '').trim();
+  return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+}
+
+/**
+ * Direction of an ANSI port. SystemVerilog lets a port INHERIT the previous
+ * port's direction -- in `module m(input logic a, b)` the `b` has no header
+ * child at all -- so a headerless port walks back through its previous siblings
+ * until one carries a direction. The first port of a list with no direction at
+ * all defaults to `input`, matching the language rule.
+ */
+function ansiPortDirection(node: SyntaxNode, source: string): string {
+  for (let cur: SyntaxNode | null = node; cur; cur = cur.previousNamedSibling) {
+    if (cur.type !== 'ansi_port_declaration') continue;
+    const header = firstChildOfTypes(cur, PORT_HEADER_NODES);
+    if (!header) continue;
+    const dir = childrenOfType(header, 'port_direction')[0];
+    if (dir) return getNodeText(dir, source).trim();
+  }
+  return 'input';
+}
+
+/**
+ * Base type keyword of a variable declaration (`reg`, `logic`, `bit`, `int`, or
+ * a user typedef name), used as the node's decorator. `var` when the type is
+ * implicit.
+ */
+function svDataKindOf(node: SyntaxNode, source: string): string {
+  const dt = childrenOfType(node, 'data_type_or_implicit')[0];
+  const inner = dt ? childrenOfType(dt, 'data_type')[0] : undefined;
+  if (!inner) return 'var';
+  const first = getNodeText(inner, source).trim().split(/[\s[#]/)[0];
+  return first || 'var';
+}
+
+/**
+ * Emit one node per declared identifier. Position comes from the identifier
+ * (so `wire a, b, c;` yields three nodes at three columns), while the signature
+ * comes from the whole declaration.
+ */
+function emitSignalNodes(
+  ids: readonly SyntaxNode[],
+  decl: SyntaxNode,
+  kind: NodeKind,
+  decorator: string,
+  ctx: ExtractorContext
+): void {
+  if (ids.length === 0) return;
+  const signature = svDeclSignature(decl, ctx.source);
+  for (const id of ids) {
+    const name = getNodeText(id, ctx.source).trim();
+    if (name) ctx.createNode(kind, name, id, { signature, decorators: [decorator] });
+  }
+}
+
+/**
+ * Blank Verilog/SystemVerilog conditional-compilation directive LINES
+ * (`ifdef / `ifndef / `elsif / `else / `endif) before the grammar sees them.
+ *
+ * The grammar has no preprocessor, so a directive line is a syntax error, and
+ * the ERROR node it produces swallows the rest of the enclosing module -- on a
+ * real ASIC design that silently drops whole files from the index (a clock
+ * module that switches between an `assign` and a cell instantiation on
+ * `ifdef FPGA loses both to the ERROR).
+ *
+ * Removing only the directive lines keeps BOTH branches, which is the right
+ * default for a code graph: an FPGA-only and an ASIC-only definition of the same
+ * net are both facts an engineer may be asking about, and a graph that answers
+ * "declared here and here" is strictly more useful than one that answers
+ * "nothing found". Replacement preserves byte offsets (directive text ->
+ * spaces, newlines kept) so every symbol's line/column stays exact.
+ *
+ * `define / `include / `timescale and macro USES are left alone -- the grammar
+ * parses those.
+ */
+export function blankVerilogConditionalDirectives(source: string): string {
+  if (source.indexOf('`') === -1) return source;
+  const re = /^([ \t]*)`(?:ifndef|ifdef|elsif|else|endif)\b[^\r\n]*/gm;
+  return source.replace(re, (m: string, indent: string) => indent + ' '.repeat(m.length - indent.length));
+}
+
+
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
 export const systemverilogExtractor: LanguageExtractor = {
+  preParse: blankVerilogConditionalDirectives,
   // Subroutines. function/task are dual-listed in methodTypes (gated by
   // methodScopeKinds below) so they read as 'method' inside a class but stay
   // 'function' inside a module. class_constructor_declaration ('function new')
@@ -570,6 +721,77 @@ export const systemverilogExtractor: LanguageExtractor = {
         }
       }
       return false; // keep walking: a field initializer may contain calls
+    }
+
+    // ANSI port list: `module m(input logic clk, output reg [7:0] q);`.
+    // Anchor on the `port_name` FIELD, never on the header child -- a
+    // direction-inheriting port (`input logic a, b` -> the `b`) has no header
+    // at all and would be dropped silently.
+    if (t === 'ansi_port_declaration') {
+      const id = getChildByField(node, 'port_name');
+      if (id) emitSignalNodes([id], node, 'field', ansiPortDirection(node, ctx.source), ctx);
+      return false; // keep walking: a default value can contain a call
+    }
+
+    // Non-ANSI port declarations: `input clk;` / `output reg [7:0] q;`. The
+    // bare name list in the header (`module n(a, b, y);`) is deliberately NOT
+    // extracted -- these declarations carry direction and type, and the header
+    // list would only duplicate them.
+    if (NONANSI_PORT_NODES.has(t)) {
+      const list = firstChildOfTypes(node, PORT_ID_LIST_NODES);
+      const ids = list ? childrenOfType(list, 'simple_identifier') : [];
+      emitSignalNodes(ids, node, 'field', t.replace('_declaration', ''), ctx);
+      return false;
+    }
+
+    // Nets: `wire [3:0] cnt;`, `tri sda;`. Note `reg`/`logic`/`bit` are NOT
+    // nets in this grammar -- they parse as data_declaration, handled below.
+    if (t === 'net_declaration') {
+      const list = childrenOfType(node, 'list_of_net_decl_assignments')[0];
+      const ids: SyntaxNode[] = [];
+      if (list) {
+        for (const a of childrenOfType(list, 'net_decl_assignment')) {
+          const id = childrenOfType(a, 'simple_identifier')[0]; // bare id, no field name
+          if (id) ids.push(id);
+        }
+      }
+      const netType = childrenOfType(node, 'net_type')[0];
+      emitSignalNodes(ids, node, 'field', netType ? getNodeText(netType, ctx.source).trim() : 'net', ctx);
+      return false;
+    }
+
+    // Variables: `reg valid;`, `logic [31:0] data_q;`, and class properties.
+    // A typedef is ALSO a data_declaration (via type_declaration) and is already
+    // extracted through typeAliasTypes -- skip it here or it doubles as a field.
+    if (t === 'data_declaration') {
+      if (childrenOfType(node, 'type_declaration').length > 0) return false;
+      const list = childrenOfType(node, 'list_of_variable_decl_assignments')[0];
+      const ids: SyntaxNode[] = [];
+      if (list) {
+        for (const a of childrenOfType(list, 'variable_decl_assignment')) {
+          const id = getChildByField(a, 'name'); // variables use a `name` field; nets do not
+          if (id) ids.push(id);
+        }
+      }
+      emitSignalNodes(ids, node, 'field', svDataKindOf(node, ctx.source), ctx);
+      return false;
+    }
+
+    // parameter / localparam. Both the `#(...)` parameter port list and the
+    // module body nest the same inner shape, so one unanchored match covers
+    // both; localparam is a SEPARATE node type and must be named explicitly.
+    if (t === 'parameter_declaration' || t === 'local_parameter_declaration') {
+      const list = childrenOfType(node, 'list_of_param_assignments')[0];
+      const ids: SyntaxNode[] = [];
+      if (list) {
+        for (const a of childrenOfType(list, 'param_assignment')) {
+          const id = childrenOfType(a, 'simple_identifier')[0];
+          if (id) ids.push(id);
+        }
+      }
+      const decorator = t === 'local_parameter_declaration' ? 'localparam' : 'parameter';
+      emitSignalNodes(ids, node, 'constant', decorator, ctx);
+      return false;
     }
 
     return false;
