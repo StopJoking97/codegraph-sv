@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **SystemVerilog and Verilog are now supported** — `.sv`, `.svh`, `.v` and `.vh` files are indexed by one grammar, so a design and its testbench land in the same graph. You get modules and the instantiation hierarchy (a module's callers are the modules that instantiate it), packages and their imports, classes and inheritance, typedefs and enums, and functions and tasks — including out-of-class bodies and the `new` constructor. UVM testbenches additionally get class composition (the env → agent → driver topology), factory `type_id::create` calls with override awareness, and TLM `.connect()` dataflow.
+- **Signals are first-class** — module ports in both the ANSI and the traditional style, nets, variables, `parameter` and `localparam` all appear in search and in your agent's answers, each carrying the declaration exactly as you wrote it. Asking where a signal comes from no longer means grepping the whole design.
+- **Conditional compilation no longer hides code** — a file using `` `ifdef ``, `` `ifndef ``, `` `elsif ``, `` `else `` or `` `endif `` used to stop being indexed partway through, silently dropping the rest of the enclosing module. Both branches are now indexed, at their real line numbers, so an FPGA-only and an ASIC-only definition of the same net are both findable.
 
 ## [1.6.0] - 2026-08-26
 
