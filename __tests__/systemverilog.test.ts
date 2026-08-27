@@ -1645,6 +1645,250 @@ endmodule
   });
 });
 
+describe('SystemVerilog hierarchical reference edges (testbench probes)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-hier-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  /**
+   * Every hier_ref and hierarchical drive out of the named source, as
+   * `<kind> <path> -> <targetQName>[ PARTIAL:<tail>]`.
+   */
+  function pathsFrom(graph: CodeGraph, sourceName: string): string[] {
+    const src =
+      graph.getNodesByKind('module').find((n) => n.name === sourceName) ??
+      graph.getNodesByKind('file').find((n) => n.name === sourceName);
+    expect(src, `source ${sourceName}`).toBeDefined();
+    return graph
+      .getOutgoingEdges(src!.id)
+      .filter((e) => e.kind === 'hier_ref' || (e.kind === 'drives' && (e.metadata as { path?: string })?.path))
+      .map((e) => {
+        const m = (e.metadata ?? {}) as { path?: string; partial?: boolean; unresolvedTail?: string };
+        const target = graph.getNode(e.target);
+        return `${e.kind} ${m.path} -> ${target?.qualifiedName ?? e.target}${m.partial ? ` PARTIAL:${m.unresolvedTail}` : ''}`;
+      })
+      .sort();
+  }
+
+  const DESIGN = {
+    'leaf.v': `
+module leaf(input clk, output reg [7:0] state);
+  always @(posedge clk) state <= state + 1;
+endmodule
+`,
+    'core.v': `
+module core(input clk);
+  leaf u_leaf(.clk(clk));
+endmodule
+`,
+    'top_dut.v': `
+module top_dut(input clk);
+  core u_core(.clk(clk));
+endmodule
+`,
+  };
+
+  it('resolves an absolute path rooted at the elaboration top, end to end', async () => {
+    cg = await indexFiles({
+      ...DESIGN,
+      'tb.sv': `
+module tb;
+  reg clk;
+  initial if (top_dut.u_core.u_leaf.state == 8'h5) clk = 1'b0;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'tb')).toEqual([
+      'hier_ref top_dut.u_core.u_leaf.state -> leaf::state',
+    ]);
+  });
+
+  it('resolves a relative path against its enclosing scope', async () => {
+    // `u_core` is not a module name — it is an INSTANCE visible inside top_dut.
+    cg = await indexFiles({
+      ...DESIGN,
+      'probe.v': `
+module top_probe(input clk);
+  core u_core(.clk(clk));
+  wire [7:0] tap = u_core.u_leaf.state;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'top_probe')).toEqual([
+      'hier_ref u_core.u_leaf.state -> leaf::state',
+    ]);
+  });
+
+  it('emits nothing when the root matches neither a module nor a visible instance', async () => {
+    cg = await indexFiles({
+      ...DESIGN,
+      'tb.sv': `
+module tb;
+  reg clk;
+  initial if (nowhere.u_core.state == 1) clk = 1'b0;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'tb')).toEqual([]);
+  });
+
+  it('never guesses among same-named instances in unrelated blocks', async () => {
+    // `u_leaf` exists inside BOTH blk_a and blk_b. A globally-unique-instance
+    // fallback would bind tb's path to whichever it found first, which is the
+    // only silent-wrongness mode this feature set could have had.
+    cg = await indexFiles({
+      'leaf.v': `
+module leaf(input clk, output reg [7:0] state);
+  always @(posedge clk) state <= state + 1;
+endmodule
+`,
+      'blocks.v': `
+module blk_a(input clk);
+  leaf u_leaf(.clk(clk));
+endmodule
+module blk_b(input clk);
+  leaf u_leaf(.clk(clk));
+endmodule
+`,
+      'tb.sv': `
+module tb;
+  reg clk;
+  initial if (u_leaf.state == 1) clk = 1'b0;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'tb')).toEqual([]);
+  });
+
+  it('labels a path that resolves only partway, and never calls it a drive', async () => {
+    cg = await indexFiles({
+      ...DESIGN,
+      'tb.sv': `
+module tb;
+  reg clk;
+  initial if (top_dut.u_missing.state == 1) clk = 1'b0;
+  initial force top_dut.u_missing.state = 8'h0;
+endmodule
+`,
+    });
+    // Both stop at top_dut. The force stays hier_ref — claiming a MODULE is
+    // driven would be a wrong answer, not an incomplete one.
+    expect(pathsFrom(cg!, 'tb')).toEqual([
+      'hier_ref top_dut.u_missing.state -> top_dut PARTIAL:u_missing.state',
+      'hier_ref top_dut.u_missing.state -> top_dut PARTIAL:u_missing.state',
+    ]);
+  });
+
+  it('makes a hierarchical force reach the driver answer for the forced signal', async () => {
+    cg = await indexFiles({
+      ...DESIGN,
+      'tb.sv': `
+module tb;
+  initial begin
+    force top_dut.u_core.u_leaf.state = 8'h0;
+    release top_dut.u_core.u_leaf.state;
+  end
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'tb')).toEqual([
+      'drives top_dut.u_core.u_leaf.state -> leaf::state',
+      'drives top_dut.u_core.u_leaf.state -> leaf::state',
+    ]);
+
+    // The driver answer is what an engineer actually queries.
+    const state = cg!.getNodesByKind('field').find((n) => n.name === 'state' && n.filePath === 'leaf.v');
+    const drivers = cg!
+      .getCallers(state!.id)
+      .filter((c) => c.edge.kind === 'drives')
+      .map((c) => c.node.name)
+      .sort();
+    expect(drivers).toEqual(['leaf', 'tb']);
+  });
+
+  it('produces no hierarchical marker for class-handle member access', async () => {
+    cg = await indexFiles({
+      'cls.sv': `
+class cfg_c;
+  int value;
+endclass
+class env_c;
+  cfg_c cfg;
+  function void go();
+    cfg.value = 5;
+    $display("%d", cfg.value);
+  endfunction
+endclass
+`,
+    });
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_hier__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    // Object member access is byte-identical to hierarchical navigation in the
+    // AST; unbounded markers there would explode on class-based testbenches.
+    expect(left).toEqual([]);
+    expect(cg!.getNodesByKind('class').map((n) => n.name).sort()).toEqual(['cfg_c', 'env_c']);
+  });
+
+  it('resolves a path in an include fragment that has no enclosing module', async () => {
+    cg = await indexFiles({
+      ...DESIGN,
+      'probe.vh': `
+initial if (top_dut.u_core.u_leaf.state == 8'h5) $display("hit");
+`,
+    });
+    expect(pathsFrom(cg!, 'probe.vh')).toEqual([
+      'hier_ref top_dut.u_core.u_leaf.state -> leaf::state',
+    ]);
+  });
+
+  it('leaves no hierarchical marker behind after indexing', async () => {
+    cg = await indexFiles({
+      ...DESIGN,
+      'tb.sv': `
+module tb;
+  reg clk;
+  initial if (top_dut.u_core.u_leaf.state == 1 || nowhere.a.b == 2) clk = 1'b0;
+endmodule
+`,
+    });
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_hier__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    expect(left).toEqual([]);
+  });
+});
+
 describe('SystemVerilog driver edges — module-scoped binding', () => {
   let tempDir: string;
   let cg: CodeGraph | undefined;

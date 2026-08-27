@@ -1873,6 +1873,170 @@ export class ReferenceResolver {
     return edges.length;
   }
 
+  /**
+   * Node kinds a hierarchical path's FINAL segment may name: a signal or port,
+   * a parameter, or a subroutine (`tb.dut.check()` is a legal probe).
+   */
+  private static readonly SV_HIER_LEAF_KINDS: ReadonlySet<string> = new Set([
+    'field',
+    'constant',
+    'function',
+    'method',
+  ]);
+
+  /**
+   * Instance name -> instantiated module node, for one module. Built from the
+   * `instantiates` edges' metadata, which is why this feature depends on
+   * instance names being recorded.
+   */
+  private buildInstanceMap(
+    moduleId: string,
+    cache: Map<string, Map<string, string>>
+  ): Map<string, string> {
+    const cached = cache.get(moduleId);
+    if (cached) return cached;
+    const instances = new Map<string, string>();
+    for (const e of this.queries.getOutgoingEdges(moduleId, ['instantiates'])) {
+      const name = (e.metadata as { instance?: string } | undefined)?.instance;
+      if (name && !instances.has(name)) instances.set(name, e.target);
+    }
+    cache.set(moduleId, instances);
+    return instances;
+  }
+
+  /**
+   * Bind the SystemVerilog hierarchical-path markers
+   * (`__sv_hier__<w|r>|<a.b.c>`) by walking the design hierarchy hop by hop.
+   * Returns the number of edges created.
+   *
+   * Root resolution is deterministic and has NO guessing mode:
+   *
+   *   1. the root matches a MODULE name — the elaboration top, which is the
+   *      dominant case in practice and unambiguous, module names being
+   *      effectively unique in a design;
+   *   2. otherwise the root matches an INSTANCE visible in the enclosing scope —
+   *      a relative path;
+   *   3. otherwise nothing is emitted.
+   *
+   * The originally-proposed fallback to a globally-unique instance name is
+   * REJECTED. It was designed around the belief that path roots are instances;
+   * in practice the overwhelming majority are the top module's name. That
+   * fallback would have introduced the only silent-wrongness mode in the whole
+   * feature set — binding a probe to a same-named instance in an unrelated
+   * block — in exchange for recall it does not actually buy.
+   *
+   * Every middle segment is an instance name inside the module reached so far.
+   * The final segment binds to a signal, parameter or subroutine there. A path
+   * that resolves PARTWAY emits an edge to the deepest module reached, flagged
+   * `partial` with the tail it could not follow, so it can never read as a
+   * complete answer.
+   *
+   * An lvalue path (`force top.core.rstn = 0;`) is backdoor stimulus and a
+   * genuine WRITE, so a fully-resolved one is emitted as a `drives` edge and
+   * reaches the driver answer. A partial write stays `hier_ref`: claiming a
+   * module is driven would be worse than saying the path was not followed.
+   */
+  resolveSvHierRefEdges(): number {
+    const PREFIX = '__sv_hier__'; // mirrors SV_HIER_PREFIX in the extractor
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'hier_ref' && ref.referenceName.startsWith(PREFIX));
+    if (candidates.length === 0) return 0;
+
+    const deleteKeys = new Map<
+      string,
+      { fromNodeId: string; referenceName: string; referenceKind: string }
+    >();
+    const edges: Edge[] = [];
+    const instancesByModule = new Map<string, Map<string, string>>();
+
+    for (const ref of candidates) {
+      deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
+        fromNodeId: ref.fromNodeId,
+        referenceName: ref.referenceName,
+        referenceKind: ref.referenceKind,
+      });
+
+      const body = ref.referenceName.slice(PREFIX.length);
+      const sep = body.indexOf('|');
+      if (sep < 0) continue;
+      const isWrite = body.slice(0, sep) === 'w';
+      const segments = body.slice(sep + 1).split('.').filter((x) => x.length > 0);
+      if (segments.length < 2) continue;
+
+      // --- root -------------------------------------------------------------
+      const root = segments[0]!;
+      let current: string | undefined = this.queries
+        .getNodesByName(root)
+        .find((n) => n.kind === 'module')?.id;
+      if (!current) {
+        current = this.buildInstanceMap(ref.fromNodeId, instancesByModule).get(root);
+      }
+      if (!current) continue; // neither a module nor a visible instance -> nothing
+
+      // --- middle segments: instance names ----------------------------------
+      let depth = 1;
+      const seen = new Set<string>([current]);
+      for (; depth < segments.length - 1; depth++) {
+        const next = this.buildInstanceMap(current, instancesByModule).get(segments[depth]!);
+        if (!next || seen.has(next)) break; // unknown instance, or a cycle
+        seen.add(next);
+        current = next;
+      }
+
+      const complete = depth === segments.length - 1;
+      const leaf = complete
+        ? this.queries
+            .getOutgoingEdges(current, ['contains'])
+            .map((e) => this.queries.getNodeById(e.target))
+            .find(
+              (n) =>
+                n !== null &&
+                n !== undefined &&
+                n.name === segments[segments.length - 1] &&
+                ReferenceResolver.SV_HIER_LEAF_KINDS.has(n.kind)
+            )
+        : undefined;
+
+      if (leaf) {
+        edges.push({
+          source: ref.fromNodeId,
+          target: leaf.id,
+          // A resolved hierarchical WRITE is a driver, so it lands in the
+          // driver answer rather than beside it.
+          kind: isWrite ? 'drives' : 'hier_ref',
+          line: ref.line,
+          column: ref.column,
+          provenance: 'tree-sitter',
+          metadata: { path: segments.join('.'), ...(isWrite ? { hierarchical: true } : {}) },
+        });
+        continue;
+      }
+
+      // Partial: the deepest module the walk reached, labelled with the tail it
+      // could not follow. Never emitted as `drives` — claiming a MODULE is
+      // driven would be a wrong answer, not an incomplete one.
+      edges.push({
+        source: ref.fromNodeId,
+        target: current,
+        kind: 'hier_ref',
+        line: ref.line,
+        column: ref.column,
+        provenance: 'tree-sitter',
+        metadata: {
+          path: segments.join('.'),
+          partial: true,
+          unresolvedTail: segments.slice(depth).join('.'),
+          ...(isWrite ? { hierarchical: true } : {}),
+        },
+      });
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    if (deleteKeys.size > 0) this.queries.deleteSpecificResolvedReferences([...deleteKeys.values()]);
+    return edges.length;
+  }
+
   /** Port directions, which are also the decorators an extracted SV port carries. */
   private static readonly SV_PORT_DIRECTIONS: ReadonlySet<string> = new Set([
     'input',
@@ -2724,6 +2888,10 @@ export class ReferenceResolver {
       if (svConn > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svConn;
       const svRead = this.resolveSvReadEdges();
       if (svRead > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svRead;
+      // Last of the SV passes: it walks instance names recorded by the instance
+      // pass and module hierarchy already persisted by the generic pass.
+      const svHier = this.resolveSvHierRefEdges();
+      if (svHier > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHier;
     } catch {
       // additive and optional; never fail the index on it
     }

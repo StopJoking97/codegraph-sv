@@ -785,6 +785,48 @@ function isReadPosition(hierId: SyntaxNode): boolean {
   return hierId.parent?.type === 'primary';
 }
 
+// -- Hierarchical references: which probe watches this RTL signal? ------------
+//
+// A testbench reaches into the design by dotted path (`top_dut.core.rstn`).
+// Those paths produced no edges at all, so the graph could not connect a probe
+// to the signal it observes, and could not answer "what breaks if I rename this
+// signal?" for anything outside the design itself.
+//
+// Only the FIRST and LAST segments name things the graph knows on its own --
+// every middle segment is an instance NAME, which is why this needs the
+// instance metadata recorded on instantiation edges.
+//
+// Marker volume is bounded at extraction time by excluding the class-handle
+// case. `obj.cfg.value` is byte-identical to hierarchical navigation in the
+// AST, and object member access is ubiquitous in class-based testbench code --
+// a marker per dotted expression would explode there while describing nothing
+// hierarchical. Anything lexically inside a `class_declaration` is therefore
+// skipped: RTL hierarchy is navigated from modules and programs, never from
+// inside a class body.
+const SV_HIER_PREFIX = '__sv_hier__';
+
+/** True when any ancestor is a class body — i.e. this dot is member access. */
+function insideClass(node: SyntaxNode): boolean {
+  for (let p = node.parent, depth = 0; p && depth < 64; p = p.parent, depth++) {
+    if (p.type === 'class_declaration') return true;
+  }
+  return false;
+}
+
+/**
+ * True when this identifier is the TARGET of an assignment -- including a
+ * `force`/`release`, which the grammar shapes as
+ * `procedural_continuous_assignment > variable_lvalue > hierarchical_identifier`.
+ *
+ * A hierarchical force is backdoor stimulus and is a genuine WRITE, so it has
+ * to reach the driver answer for the signal it forces rather than being filed
+ * as a plain reference.
+ */
+function isLvaluePosition(hierId: SyntaxNode): boolean {
+  const t = hierId.parent?.type;
+  return t === 'variable_lvalue' || t === 'net_lvalue' || t === 'nonrange_variable_lvalue';
+}
+
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
@@ -950,15 +992,39 @@ export const systemverilogExtractor: LanguageExtractor = {
       const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
       if (!fromId) return false;
       const ids = childrenOfType(node, 'simple_identifier');
-      if (ids.length === 1 && ids[0] && isReadPosition(node)) {
-        const name = getNodeText(ids[0], ctx.source).trim();
-        if (name) {
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+
+      if (ids.length === 1) {
+        if (ids[0] && isReadPosition(node)) {
+          const name = getNodeText(ids[0], ctx.source).trim();
+          if (name) {
+            ctx.addUnresolvedReference({
+              fromNodeId: fromId,
+              referenceName: `${SV_READ_PREFIX}${name}`,
+              referenceKind: 'reads',
+              line,
+              column,
+            });
+          }
+        }
+        return false; // keep walking: a select's index is its own subtree
+      }
+
+      // Multi-segment: a hierarchical path. Module-scoped binding cannot reach
+      // it, so it walks the design hierarchy hop by hop in the post-pass.
+      if (!insideClass(node)) {
+        const segments = ids.map((id) => getNodeText(id, ctx.source).trim());
+        if (segments.every((seg) => seg.length > 0)) {
+          // `w` marks an lvalue path (including force/release), which must reach
+          // the DRIVER answer rather than being filed as a plain reference.
+          const mode = isLvaluePosition(node) ? 'w' : 'r';
           ctx.addUnresolvedReference({
             fromNodeId: fromId,
-            referenceName: `${SV_READ_PREFIX}${name}`,
-            referenceKind: 'reads',
-            line: node.startPosition.row + 1,
-            column: node.startPosition.column,
+            referenceName: `${SV_HIER_PREFIX}${mode}|${segments.join('.')}`,
+            referenceKind: 'hier_ref',
+            line,
+            column,
           });
         }
       }

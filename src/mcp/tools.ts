@@ -392,7 +392,7 @@ const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
  * is declared in a different file from the net it is wired to — in both cases
  * the node's startLine points at something the reader did not ask about.
  */
-const HDL_SITE_EDGE_KINDS: ReadonlySet<string> = new Set(['drives', 'connects', 'reads']);
+const HDL_SITE_EDGE_KINDS: ReadonlySet<string> = new Set(['drives', 'connects', 'reads', 'hier_ref']);
 
 /**
  * Cap on what PERIPHERAL nodes (in the subgraph, but neither a query match nor
@@ -6392,7 +6392,16 @@ export class ToolHandler {
       .filter((e) => e.kind === 'reads')
       .map((e) => ({ node: cg.getNode(e.source), edge: e }))
       .filter((r): r is { node: Node; edge: Edge } => r.node !== null && r.node !== undefined);
-    if (callees.length === 0 && callers.length === 0 && readers.length === 0) return '';
+    // Hierarchical probes come straight from the edge table too. A PARTIAL one
+    // targets an enclosing module, and a module is also an `instantiates`
+    // target — routing these through the caller traversal would let its
+    // visited-set drop one of the two.
+    const probes = cg
+      .getIncomingEdges(node.id)
+      .filter((e) => e.kind === 'hier_ref')
+      .map((e) => ({ node: cg.getNode(e.source), edge: e }))
+      .filter((r): r is { node: Node; edge: Edge } => r.node !== null && r.node !== undefined);
+    if (callees.length === 0 && callers.length === 0 && readers.length === 0 && probes.length === 0) return '';
     const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
       lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
@@ -6402,6 +6411,9 @@ export class ToolHandler {
     }
     if (readers.length > 0) {
       lines.push(`**Read by ←** ${readers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${readers.length > TRAIL_CAP ? `, +${readers.length - TRAIL_CAP} more` : ''}`);
+    }
+    if (probes.length > 0) {
+      lines.push(`**Probed by ←** ${probes.slice(0, TRAIL_CAP).map(fmt).join(', ')}${probes.length > TRAIL_CAP ? `, +${probes.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
   }
@@ -6988,7 +7000,15 @@ export class ToolHandler {
     // A `drives` caller is a MODULE, and a module spans the whole file — its
     // own startLine locates nothing. The write site is the answer, so it rides
     // in the label rather than being dropped.
-    if (edge.kind === 'drives') return edge.line ? `drives at line ${edge.line}` : 'drives';
+    if (edge.kind === 'drives') {
+      // A hierarchical force/release is backdoor stimulus reaching in from
+      // another module. Labelling it like an ordinary in-module assignment
+      // would hide the one thing that makes it worth noticing.
+      const path = (edge.metadata as { path?: string } | undefined)?.path;
+      const at = edge.line ? ` at line ${edge.line}` : '';
+      if (path) return `drives via ${path}${at}`;
+      return edge.line ? `drives at line ${edge.line}` : 'drives';
+    }
     // A `connects` edge relates one instance port to the net wired to it. The
     // containing node's line locates nothing useful (a port is declared in the
     // child module, the net in the parent), so the CONNECTION's own site rides
@@ -7007,6 +7027,17 @@ export class ToolHandler {
       if (!lines || lines.length === 0) return 'reads';
       const shown = lines.slice(0, 6).join(', ');
       return `reads at line${lines.length > 1 ? 's' : ''} ${shown}${lines.length > 6 ? `, +${lines.length - 6} more` : ''}`;
+    }
+    // A `hier_ref` edge is a dotted path resolved hop by hop. The PATH is the
+    // answer — and a PARTIAL resolution must say so in the label, or a probe
+    // bound only as far as some enclosing module reads as a complete answer.
+    if (edge.kind === 'hier_ref') {
+      const m = (edge.metadata ?? {}) as { path?: string; partial?: boolean; unresolvedTail?: string };
+      const at = edge.line ? ` at line ${edge.line}` : '';
+      if (m.partial) {
+        return `PARTIAL hierarchical ref ${m.path ?? ''} — unresolved from "${m.unresolvedTail ?? '?'}"${at}`;
+      }
+      return `hierarchical ref ${m.path ?? ''}${at}`;
     }
     return edge.kind;
   }
