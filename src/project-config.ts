@@ -529,16 +529,18 @@ function extractVerify(parsed: object, file: string): VerifyConfig {
   const includeDirs = strings(raw.includeDirs, 'includeDirs');
   const include = strings(raw.include, 'include');
   const exclude = strings(raw.exclude, 'exclude');
-  if (
-    includeDirs.length === 0 &&
-    include.length === 0 &&
-    exclude.length === 0 &&
-    Object.keys(defines).length === 0 &&
-    raw.minCoverage === undefined
-  ) {
-    return EMPTY_VERIFY;
-  }
-  return { includeDirs, defines, include, exclude, minCoverage, configured: true };
+  // `configured` reports whether the GRADING was tightened — include dirs,
+  // defines, globs — and drives the SYNTAX-ONLY advisory. `minCoverage` tightens
+  // the GATE, not the grade, so counting it here would let a project silence the
+  // "graded loosely" warning by lowering its own coverage floor. That pairing is
+  // the one most worth warning about, not least.
+  const gradingConfigured =
+    includeDirs.length > 0 ||
+    include.length > 0 ||
+    exclude.length > 0 ||
+    Object.keys(defines).length > 0;
+  if (!gradingConfigured && raw.minCoverage === undefined) return EMPTY_VERIFY;
+  return { includeDirs, defines, include, exclude, minCoverage, configured: gradingConfigured };
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

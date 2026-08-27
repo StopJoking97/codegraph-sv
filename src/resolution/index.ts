@@ -2046,9 +2046,12 @@ export class ReferenceResolver {
           .getNodesByName(root)
           .filter((n) => n.language === ref.language);
         const modules = named.filter((n) => n.kind === 'module');
-        const shadowed = named.some((n) =>
-          ReferenceResolver.SV_BINDABLE_MEMBER_KINDS.has(n.kind)
-        );
+        // The LEAF kinds, not the bindable-member kinds: the question here is
+        // "could this name be the real subject of a dotted path?", and a
+        // `function`/`method` answers yes just as a signal does. Using the
+        // narrower member set would let `module my_task` capture a path rooted
+        // at a same-named subroutine.
+        const shadowed = named.some((n) => ReferenceResolver.SV_HIER_LEAF_KINDS.has(n.kind));
         if (modules.length === 1 && !shadowed) current = modules[0]!.id;
       }
 

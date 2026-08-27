@@ -100,6 +100,13 @@ export type VerifyOutcome =
        * all of its SystemVerilog owes exactly the evidence it just skipped.
        */
       indexedFiles: number;
+      /**
+       * Files of ANY language in the index. Zero SystemVerilog is only benign
+       * when the index actually holds something else; an index holding nothing
+       * at all was never built, or lost its rows, and letting that pass is the
+       * worst outcome available — the design is real and unverified.
+       */
+      indexedFilesTotal: number;
     }
   | {
       status: 'ok';
@@ -108,9 +115,13 @@ export type VerifyOutcome =
       staleFiles: string[];
       scopedFiles: number;
       indexedFiles: number;
+      indexedFilesTotal: number;
       /** Files the oracle actually returned a verdict for. */
       gradedFiles: number;
-      /** The project's coverage floor for `--strict` (fraction of scoped). */
+      /**
+       * The project's coverage floor for `--strict`: the share of the
+       * SystemVerilog files IN THE INDEX that must come back graded.
+       */
       minCoverage: number;
       /** True when the project supplied include dirs / defines / globs. */
       configured: boolean;
@@ -121,6 +132,24 @@ export type VerifyOutcome =
 /** Normalize an index path to the forward-slash form the oracle speaks. */
 function norm(p: string): string {
   return p.replace(/\\/g, '/');
+}
+
+/**
+ * How many files must be graded for `--strict` to pass, from a fractional floor.
+ *
+ * The product is rounded before the ceiling because it is a float: `100 * 0.07`
+ * is `7.000000000000001` in IEEE 754, so a bare `Math.ceil` demands 8 files for
+ * a floor whose author wrote 7 — and a bare `<` comparison against the raw
+ * product fails a run of exactly 7 for the same reason. Rounding to six places
+ * first kills the 1e-15 artifact while leaving a genuine fraction alone
+ * (41 * 0.9 = 36.9 still requires 37).
+ *
+ * The gate and the report both read this one function, so they cannot disagree
+ * about the number — a report that prints a floor the exit code does not
+ * enforce is its own kind of false green.
+ */
+export function requiredGradedFiles(scopedFiles: number, minCoverage: number): number {
+  return Math.ceil(Number((scopedFiles * minCoverage).toFixed(6)));
 }
 
 /**
@@ -155,7 +184,9 @@ export function verifyIndex(
   const config = loadVerifyConfig(root);
 
   const indexedPaths: string[] = [];
+  let indexedFilesTotal = 0;
   for (const file of queries.getAllFiles()) {
+    indexedFilesTotal++;
     if (file.language === 'systemverilog') indexedPaths.push(file.path);
   }
   const scoped = scopeFiles(indexedPaths, config.include, config.exclude);
@@ -186,6 +217,7 @@ export function verifyIndex(
       staleFiles,
       scopedFiles: scoped.length,
       indexedFiles: indexedPaths.length,
+      indexedFilesTotal,
     };
   }
 
@@ -244,6 +276,7 @@ export function verifyIndex(
     staleFiles,
     scopedFiles: scoped.length,
     indexedFiles: indexedPaths.length,
+    indexedFilesTotal,
     gradedFiles: Object.keys(outcome.report.files).length,
     minCoverage: config.minCoverage,
     configured: config.configured,
@@ -260,7 +293,9 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
 
   if (outcome.status === 'skipped') {
     lines.push('codegraph verify: SKIPPED — ' + outcome.reason);
-    lines.push(`  scoped: ${outcome.scopedFiles} SystemVerilog files in the index`);
+    lines.push(
+      `  scoped: ${outcome.scopedFiles} of ${outcome.indexedFiles} SystemVerilog files in the index`
+    );
     if (outcome.staleFiles.length > 0) {
       lines.push('');
       lines.push(`  STALE — ${outcome.staleFiles.length} indexed file(s) are no longer on disk:`);
@@ -270,7 +305,20 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
     }
     lines.push('');
     lines.push('  Install the grader with: pip install "pyslang==11.*"');
-    if (strict) {
+    if (outcome.indexedFilesTotal === 0) {
+      lines.push('');
+      lines.push('  EMPTY INDEX — it holds no files of any language, so it was never built or');
+      lines.push('  has lost its rows. Everything on disk is unverified; --strict fails on this.');
+    } else if (outcome.indexedFiles === 0) {
+      // A missing grader on a project with no SystemVerilog is two absences
+      // stacked, and only the second one matters. Announcing a strict FAILURE
+      // here while verifyExitCode correctly returns 0 would leave the text and
+      // the exit code saying opposite things about the same run — and the text
+      // is what a person reads.
+      lines.push('');
+      lines.push('  NOTHING TO VERIFY — the index holds no SystemVerilog either way, so there');
+      lines.push('  was no measurement for the oracle to make. --strict does not block on this.');
+    } else if (strict) {
       lines.push('');
       lines.push('  STRICT: failing — the oracle never ran, so NOTHING was verified.');
       lines.push('  A skip is a pass only in the default mode; --strict asks for evidence.');
@@ -293,15 +341,25 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
       `${outcome.scopedFiles < outcome.indexedFiles ? ' (narrowed by verify.include/exclude)' : ''}` +
       `; ${outcome.gradedFiles} graded`
   );
-  if (outcome.scopedFiles > 0 && outcome.gradedFiles < outcome.scopedFiles) {
-    const floor = Math.ceil(outcome.scopedFiles * outcome.minCoverage);
+  if (outcome.indexedFiles > 0 && outcome.gradedFiles < outcome.indexedFiles) {
+    const floor = requiredGradedFiles(outcome.indexedFiles, outcome.minCoverage);
+    const excluded = outcome.indexedFiles - outcome.scopedFiles;
+    const ungraded = outcome.scopedFiles - outcome.gradedFiles;
     lines.push(
-      `  COVERAGE  ${outcome.gradedFiles} / ${outcome.scopedFiles} scoped files graded` +
-        ` — ${outcome.scopedFiles - outcome.gradedFiles} came back with no verdict.` +
-        ` --strict requires ${floor} (verify.minCoverage ${outcome.minCoverage}).`
+      `  COVERAGE  ${outcome.gradedFiles} / ${outcome.indexedFiles} indexed files graded` +
+        (excluded > 0 ? ` — ${excluded} excluded by config` : '') +
+        (ungraded > 0 ? `${excluded > 0 ? ',' : ' —'} ${ungraded} came back with no verdict` : '') +
+        `. --strict requires ${floor} (verify.minCoverage ${outcome.minCoverage}).`
     );
   }
   lines.push('');
+
+  if (outcome.indexedFilesTotal === 0) {
+    lines.push('  EMPTY INDEX — it holds no files of any language.');
+    lines.push('  This index was never built, or has lost its rows. Every file on disk is');
+    lines.push('  unverified, which is the failure this pass exists to catch — --strict fails.');
+    return lines.join('\n');
+  }
 
   if (outcome.indexedFiles === 0) {
     lines.push('  NOTHING TO VERIFY — the index holds no SystemVerilog.');
@@ -406,18 +464,26 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
  */
 export function verifyExitCode(outcome: VerifyOutcome, strict = false): number {
   if (!strict) return 0;
-  // Nothing to verify — not a failure, and not a pass anyone should read as
-  // evidence either. The report says so in words; the exit code stays out of
-  // the way.
-  if (outcome.indexedFiles === 0) return 0;
+  if (outcome.indexedFiles === 0) {
+    // No SystemVerilog. Benign only if the index actually holds something else:
+    // an index with no files AT ALL was never built, or lost its rows, and
+    // greening that is the worst outcome on offer — the design is real, on
+    // disk, and completely unverified, which is the failure this pass exists to
+    // catch. A TypeScript repo genuinely owes nothing and passes.
+    return outcome.indexedFilesTotal === 0 ? 1 : 0;
+  }
   if (outcome.status === 'skipped') return 1;
-  // SystemVerilog exists but the config kept all of it out of scope.
-  if (outcome.scopedFiles === 0) return 1;
+  // A run proves only as much as it covered, and the denominator is the whole
+  // indexed design — NOT what survived the config's globs. Measuring coverage
+  // against post-glob scope made `verify.exclude` a bypass: narrow 41 files to
+  // 1, grade that 1, and a run proving nothing exits 0 with a clean 100.0%,
+  // indistinguishable from a full pass. Excluding files is still allowed; it
+  // now costs an explicit, readable `minCoverage` in codegraph.json instead of
+  // being free and invisible.
+  if (outcome.gradedFiles < requiredGradedFiles(outcome.indexedFiles, outcome.minCoverage)) {
+    return 1;
+  }
   if (outcome.result.graded === 0) return 1;
-  // A run proves only as much as it covered. Files handed to the oracle that
-  // came back with no verdict are a hole the recall percentage cannot show,
-  // because the percentage is computed over what survived.
-  if (outcome.gradedFiles < outcome.scopedFiles * outcome.minCoverage) return 1;
   return outcome.result.missing > 0 ? 1 : 0;
 }
 

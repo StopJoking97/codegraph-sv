@@ -19,6 +19,7 @@ import {
   scopeFiles,
   formatVerifyReport,
   verifyExitCode,
+  requiredGradedFiles,
   runGrader,
   interpretGraderOutput,
   oracleScriptPath,
@@ -251,6 +252,40 @@ describe('verify — project config', () => {
     write({ extensions: { '.foo': 'lua' }, verify: { includeDirs: ['inc'] } });
     expect(loadVerifyConfig(dir).includeDirs).toEqual(['inc']);
   });
+
+  /** Config is memoized per root, so a second write in one test needs a flush. */
+  const rewrite = (obj: unknown) => {
+    write(obj);
+    clearProjectConfigCache();
+  };
+
+  it('defaults the coverage floor to 1 and refuses a value outside [0, 1]', () => {
+    rewrite({});
+    expect(loadVerifyConfig(dir).minCoverage).toBe(1);
+    // The likely mistake is writing 90 for "90%". Keeping the default is the safe
+    // direction — it can only make --strict harder to pass, never softer than
+    // the author intended.
+    rewrite({ verify: { minCoverage: 90 } });
+    expect(loadVerifyConfig(dir).minCoverage).toBe(1);
+    rewrite({ verify: { minCoverage: -0.5 } });
+    expect(loadVerifyConfig(dir).minCoverage).toBe(1);
+    rewrite({ verify: { minCoverage: 0.8 } });
+    expect(loadVerifyConfig(dir).minCoverage).toBe(0.8);
+  });
+
+  it('does not let a coverage floor alone claim the grading was configured', () => {
+    // `configured` drives the SYNTAX-ONLY advisory, which is about how tightly
+    // the oracle GRADED. minCoverage tightens the GATE. Counting it here would
+    // let a project silence "graded loosely" by lowering its own floor — the one
+    // pairing most worth warning about.
+    rewrite({ verify: { minCoverage: 0.5 } });
+    const cfg = loadVerifyConfig(dir);
+    expect(cfg.minCoverage).toBe(0.5);
+    expect(cfg.configured).toBe(false);
+
+    rewrite({ verify: { minCoverage: 0.5, includeDirs: ['inc'] } });
+    expect(loadVerifyConfig(dir).configured).toBe(true);
+  });
 });
 
 describe('verify — degradation paths (no grader installed)', () => {
@@ -373,6 +408,7 @@ describe('verify — degradation paths (no grader installed)', () => {
       staleFiles: [],
       scopedFiles: 41,
       indexedFiles: 41,
+      indexedFilesTotal: 41,
     };
     const text = formatVerifyReport(outcome);
     expect(text).toContain('SKIPPED');
@@ -392,6 +428,7 @@ describe('verify — degradation paths (no grader installed)', () => {
       staleFiles: [],
       scopedFiles: 41,
       indexedFiles: 41,
+      indexedFilesTotal: 41,
     };
     expect(verifyExitCode(outcome, true)).toBe(1);
     const text = formatVerifyReport(outcome, true);
@@ -410,6 +447,7 @@ describe('verify — degradation paths (no grader installed)', () => {
       staleFiles: ['sim/old_tb.sv'],
       scopedFiles: 41,
       indexedFiles: 41,
+      indexedFilesTotal: 41,
     });
     expect(text).toContain('STALE');
     expect(text).toContain('sim/old_tb.sv');
@@ -427,6 +465,7 @@ describe('verify — report rendering and exit codes', () => {
       graded: number;
       scopedFiles: number;
       indexedFiles: number;
+      indexedFilesTotal: number;
       gradedFiles: number;
       minCoverage: number;
     }> = {}
@@ -472,6 +511,7 @@ describe('verify — report rendering and exit codes', () => {
       staleFiles: [],
       scopedFiles: over.scopedFiles ?? 1,
       indexedFiles: over.indexedFiles ?? 1,
+      indexedFilesTotal: over.indexedFilesTotal ?? 1,
       gradedFiles: over.gradedFiles ?? 1,
       minCoverage: over.minCoverage ?? 1,
       configured: over.configured ?? true,
@@ -534,6 +574,7 @@ describe('verify — report rendering and exit codes', () => {
       scopedFiles: 0,
       indexedFiles: 0,
       gradedFiles: 0,
+      indexedFilesTotal: 40, // a real index — 40 TypeScript files, no SystemVerilog
     });
     expect(verifyExitCode(nothingToVerify, true)).toBe(0);
     expect(verifyExitCode(nothingToVerify, false)).toBe(0);
@@ -544,6 +585,96 @@ describe('verify — report rendering and exit codes', () => {
     expect(text).not.toContain('100.0%');
   });
 
+  it('does not print a STRICT failure on a skip that the exit code passes', () => {
+    // Two absences stacked: no grader AND no SystemVerilog. Only the second one
+    // decides the outcome, and verifyExitCode already returns 0 for it. The
+    // renderer used to announce "STRICT: failing" on any skip, so the text a
+    // person reads contradicted the exit code a machine reads.
+    const nothingEitherWay = {
+      status: 'skipped' as const,
+      reason: 'pyslang is not installed (pip install "pyslang==11.*")',
+      staleFiles: [],
+      scopedFiles: 0,
+      indexedFiles: 0,
+      indexedFilesTotal: 40, // a real index, just not a SystemVerilog one
+    };
+    expect(verifyExitCode(nothingEitherWay, true)).toBe(0);
+    const text = formatVerifyReport(nothingEitherWay, true);
+    expect(text).toContain('NOTHING TO VERIFY');
+    expect(text).not.toContain('STRICT: failing');
+
+    // A skip on a project that DOES hold SystemVerilog still fails loudly.
+    const realSkip = { ...nothingEitherWay, scopedFiles: 41, indexedFiles: 41, indexedFilesTotal: 41 };
+    expect(verifyExitCode(realSkip, true)).toBe(1);
+    expect(formatVerifyReport(realSkip, true)).toContain('STRICT: failing');
+  });
+
+  it('FAILS an index holding no files at all, rather than reading it as "no SystemVerilog"', () => {
+    // The inverse risk of the nothing-to-verify pass, and the worse one. A
+    // truncated or never-built .codegraph opens fine and reports zero
+    // SystemVerilog files — identical arithmetic to a TypeScript repo. Greening
+    // that means a real design, fully on disk, passes --strict completely
+    // unverified: the exact failure this pass exists to catch.
+    const emptyIndex = okOutcome({
+      graded: 0,
+      scopedFiles: 0,
+      indexedFiles: 0,
+      gradedFiles: 0,
+      indexedFilesTotal: 0,
+    });
+    expect(verifyExitCode(emptyIndex, true)).toBe(1);
+    expect(verifyExitCode(emptyIndex, false)).toBe(0);
+    const text = formatVerifyReport(emptyIndex, true);
+    expect(text).toContain('EMPTY INDEX');
+    expect(text).not.toContain('NOTHING TO VERIFY');
+
+    // Same for a skip on an empty index.
+    const emptySkip = {
+      status: 'skipped' as const,
+      reason: 'pyslang is not installed',
+      staleFiles: [],
+      scopedFiles: 0,
+      indexedFiles: 0,
+      indexedFilesTotal: 0,
+    };
+    expect(verifyExitCode(emptySkip, true)).toBe(1);
+    expect(formatVerifyReport(emptySkip, true)).toContain('EMPTY INDEX');
+  });
+
+  it('FAILS under --strict when the config excluded its way down to a handful of files', () => {
+    // The half of the original finding the first fix missed. Measuring coverage
+    // against POST-glob scope made `verify.exclude` a bypass: narrow 41 files to
+    // 1, grade that 1 perfectly, and a run proving nothing exits 0 with a clean
+    // 100.0% — indistinguishable from a full pass. The denominator has to be the
+    // whole indexed design.
+    const excludedDown = okOutcome({ scopedFiles: 1, indexedFiles: 41, indexedFilesTotal: 41, gradedFiles: 1 });
+    expect(verifyExitCode(excludedDown, true)).toBe(1);
+    expect(verifyExitCode(excludedDown, false)).toBe(0);
+
+    const text = formatVerifyReport(excludedDown, true);
+    expect(text).toContain('COVERAGE  1 / 41 indexed files graded');
+    expect(text).toContain('40 excluded by config');
+
+    // Excluding is still ALLOWED — it just has to be declared, not free.
+    expect(
+      verifyExitCode(okOutcome({ scopedFiles: 1, indexedFiles: 41, indexedFilesTotal: 41, gradedFiles: 1, minCoverage: 0.01 }), true)
+    ).toBe(0);
+  });
+
+  it('computes the coverage floor without inheriting float error from the product', () => {
+    // `100 * 0.07` is 7.000000000000001 in IEEE 754, so comparing against the
+    // raw product failed a run of exactly 7 files, and a bare Math.ceil demanded
+    // 8 — for a floor its author wrote as 7.
+    expect(requiredGradedFiles(100, 0.07)).toBe(7);
+    expect(verifyExitCode(okOutcome({ scopedFiles: 100, indexedFiles: 100, gradedFiles: 7, minCoverage: 0.07 }), true)).toBe(0);
+    expect(verifyExitCode(okOutcome({ scopedFiles: 100, indexedFiles: 100, gradedFiles: 6, minCoverage: 0.07 }), true)).toBe(1);
+
+    // A genuine fraction is still rounded UP, not away.
+    expect(requiredGradedFiles(41, 0.9)).toBe(37);
+    expect(requiredGradedFiles(100, 0.29)).toBe(29);
+    expect(requiredGradedFiles(41, 1)).toBe(41);
+  });
+
   it('FAILS under --strict when the config kept every SystemVerilog file out of scope', () => {
     // The mirror of the case above and the reason the two zeroes cannot share a
     // test: SystemVerilog IS indexed here, and an exclude glob is the thing that
@@ -552,6 +683,7 @@ describe('verify — report rendering and exit codes', () => {
       graded: 0,
       scopedFiles: 0,
       indexedFiles: 41,
+      indexedFilesTotal: 41,
       gradedFiles: 0,
     });
     expect(verifyExitCode(excludedAway, true)).toBe(1);

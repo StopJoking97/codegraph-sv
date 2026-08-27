@@ -1927,6 +1927,29 @@ endmodule
     expect(pathsFrom(cg!, 'm')).toEqual([]);
   });
 
+  it('drops a member select whose subject is a subroutine, not just a signal', async () => {
+    // The third way past the local-member rule, and the one the narrower kind
+    // set left open: a hierarchical path can legally END at a function or task,
+    // so a function name is just as capable of being the real subject as a
+    // signal is. Testing only the signal kinds let `module ctrl` capture a path
+    // rooted at a same-named subroutine.
+    cg = await indexFiles({
+      'a.sv': `
+module a;
+  function automatic void ctrl();
+  endfunction
+  always_comb ctrl.done = 1'b1;
+endmodule
+`,
+      'ctrl.sv': `
+module ctrl(input clk, output reg done);
+  always @(posedge clk) done <= 1'b1;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'a')).toEqual([]);
+  });
+
   it('keeps an absolute probe inside its own design when two designs share a top name', async () => {
     // `module tb` in two designs is routine in verification repos. Binding the
     // root by global name took the first in file-path order, so design B's probe
