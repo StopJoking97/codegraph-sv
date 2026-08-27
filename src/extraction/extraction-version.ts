@@ -21,4 +21,11 @@
  * turns the re-index hint into noise — keep it honest (see CLAUDE.md, "Honesty
  * in the product is load-bearing").
  */
-export const EXTRACTION_VERSION = 25;
+/*
+ * 26 — SystemVerilog graph completion: three new edge kinds (`connects`,
+ * `reads`, `hier_ref`), `macro` nodes for `define/`ifdef, and instance-name
+ * metadata on `instantiates` edges (the hierarchical walk needs it). An index
+ * stamped 25 or lower has none of that content and must be re-indexed to
+ * answer port-connection, net-reader, or hierarchical-probe queries.
+ */
+export const EXTRACTION_VERSION = 26;
