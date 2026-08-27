@@ -383,8 +383,16 @@ const ISOLATED_WEAK_KIND_WEIGHT = 0.08;
  */
 const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
   'calls', 'references', 'extends', 'implements', 'overrides',
-  'instantiates', 'returns', 'type_of', 'decorates', 'drives',
+  'instantiates', 'returns', 'type_of', 'decorates', 'drives', 'connects',
 ]);
+
+/**
+ * HDL relationships whose LINE is the fact, not the related symbol's own
+ * declaration line. A driving module spans its whole file, and a connected port
+ * is declared in a different file from the net it is wired to — in both cases
+ * the node's startLine points at something the reader did not ask about.
+ */
+const HDL_SITE_EDGE_KINDS: ReadonlySet<string> = new Set(['drives', 'connects']);
 
 /**
  * Cap on what PERIPHERAL nodes (in the subgraph, but neither a query match nor
@@ -6351,9 +6359,16 @@ export class ToolHandler {
   private formatTrail(cg: CodeGraph, node: Node): string {
     const TRAIL_CAP = 12;
     const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      // An HDL relationship is located by the SITE it happened at, not by the
+      // related symbol's declaration: a driving module spans the whole file, and
+      // a connected port is declared in a different file from the net it wires
+      // to. Both would send the reader to a line that shows nothing.
+      const site = HDL_SITE_EDGE_KINDS.has(e.edge.kind) && e.edge.line ? e.edge.line : e.node.startLine;
+      const base = `${e.node.name} (${e.node.filePath}:${site})`;
+      const hdl = HDL_SITE_EDGE_KINDS.has(e.edge.kind) ? this.edgeLabel(e.edge) : null;
       const synth = this.synthEdgeNote(e.edge);
-      return synth ? `${base} [${synth.compact}]` : base;
+      if (synth) return `${base} [${synth.compact}]`;
+      return hdl ? `${base} [${hdl}]` : base;
     };
     const collect = (edges: Array<{ node: Node; edge: Edge }>): Array<{ node: Node; edge: Edge }> => {
       const seen = new Set<string>([node.id]);
@@ -6961,6 +6976,16 @@ export class ToolHandler {
     // own startLine locates nothing. The write site is the answer, so it rides
     // in the label rather than being dropped.
     if (edge.kind === 'drives') return edge.line ? `drives at line ${edge.line}` : 'drives';
+    // A `connects` edge relates one instance port to the net wired to it. The
+    // containing node's line locates nothing useful (a port is declared in the
+    // child module, the net in the parent), so the CONNECTION's own site rides
+    // in the label along with the instance and port it belongs to.
+    if (edge.kind === 'connects') {
+      const m = (edge.metadata ?? {}) as { instance?: string; port?: string; portDirection?: string };
+      const what = m.instance && m.port ? `${m.instance}.${m.port}` : (m.port ?? 'port');
+      const dir = m.portDirection ? ` ${m.portDirection}` : '';
+      return edge.line ? `connects ${what}${dir} at line ${edge.line}` : `connects ${what}${dir}`;
+    }
     return edge.kind;
   }
 

@@ -1968,7 +1968,17 @@ program
       // `driveLine` is the write site of a `drives` edge. A driven net's caller is
       // the enclosing MODULE, which spans the whole file, so its own startLine
       // locates nothing — the assign/always line is what was actually asked for.
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number; driveLine?: number }> = [];
+      // `connectLine`/`connection` do the same for a `connects` edge: the caller
+      // is a signal in ANOTHER module, so the instantiation site is the only
+      // line that points at the wiring the question was about.
+      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number; driveLine?: number; connectLine?: number; connection?: string }> = [];
+      /** `<instance>.<port> <direction>` for a connects edge, else undefined. */
+      const connectionOf = (edge: { kind: string; metadata?: Record<string, unknown> }): string | undefined => {
+        if (edge.kind !== 'connects') return undefined;
+        const m = (edge.metadata ?? {}) as { instance?: string; port?: string; portDirection?: string };
+        const what = m.instance && m.port ? `${m.instance}.${m.port}` : (m.port ?? 'port');
+        return m.portDirection ? `${what} ${m.portDirection}` : what;
+      };
 
       for (const match of matches) {
         const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
@@ -1977,7 +1987,9 @@ program
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine,
-              driveLine: c.edge.kind === 'drives' ? c.edge.line : undefined });
+              driveLine: c.edge.kind === 'drives' ? c.edge.line : undefined,
+              connectLine: c.edge.kind === 'connects' ? c.edge.line : undefined,
+              connection: connectionOf(c.edge) });
           }
         }
       }
@@ -1988,7 +2000,9 @@ program
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine,
-              driveLine: c.edge.kind === 'drives' ? c.edge.line : undefined });
+              driveLine: c.edge.kind === 'drives' ? c.edge.line : undefined,
+              connectLine: c.edge.kind === 'connects' ? c.edge.line : undefined,
+              connection: connectionOf(c.edge) });
           }
         }
       }
@@ -2002,12 +2016,21 @@ program
       } else {
         console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
         for (const node of limited) {
-          const loc = node.driveLine ? `:${node.driveLine}` : node.startLine ? `:${node.startLine}` : '';
+          // A drive or a connection is located by its OWN site, not by the
+          // caller node's declaration: the module spans the whole file, and a
+          // connected port is declared in a different one entirely.
+          const siteLine = node.driveLine ?? node.connectLine;
+          const loc = siteLine ? `:${siteLine}` : node.startLine ? `:${node.startLine}` : '';
+          const via = node.driveLine
+            ? '  (drives)'
+            : node.connectLine
+              ? `  (connects ${node.connection ?? ''})`.trimEnd()
+              : '';
           console.log(
             chalk.cyan(node.kind.padEnd(12)) +
             chalk.white(node.name)
           );
-          console.log(chalk.dim(`  ${node.filePath}${loc}${node.driveLine ? '  (drives)' : ''}`));
+          console.log(chalk.dim(`  ${node.filePath}${loc}${via}`));
           console.log();
         }
       }

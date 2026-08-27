@@ -1783,6 +1783,199 @@ export class ReferenceResolver {
     return changed;
   }
 
+  /** Port directions, which are also the decorators an extracted SV port carries. */
+  private static readonly SV_PORT_DIRECTIONS: ReadonlySet<string> = new Set([
+    'input',
+    'output',
+    'inout',
+  ]);
+
+  /**
+   * A module's FORMAL ports: port name -> { id, direction }.
+   *
+   * Filters on DIRECTION rather than taking the last same-named member, which
+   * is load-bearing for legacy Verilog: `module m(y); output y; reg y;`
+   * re-declares the output as a net so a procedural block can drive it, leaving
+   * two same-named `field` children where only one is the port. A last-write-
+   * wins lookup binds the connection to the internal register instead of to the
+   * port, which is wrong in a way nothing downstream can detect.
+   *
+   * A port re-declared with an explicit direction twice keeps the FIRST — the
+   * header declaration — for the same reason.
+   */
+  private buildPortMap(
+    moduleId: string,
+    cache: Map<string, Map<string, { id: string; direction: string }>>
+  ): Map<string, { id: string; direction: string }> {
+    const cached = cache.get(moduleId);
+    if (cached) return cached;
+    const ports = new Map<string, { id: string; direction: string }>();
+    for (const e of this.queries.getOutgoingEdges(moduleId, ['contains'])) {
+      const child = this.queries.getNodeById(e.target);
+      if (!child || child.kind !== 'field') continue;
+      const direction = child.decorators?.find((d) =>
+        ReferenceResolver.SV_PORT_DIRECTIONS.has(d)
+      );
+      if (!direction) continue;
+      if (!ports.has(child.name)) ports.set(child.name, { id: child.id, direction });
+    }
+    cache.set(moduleId, ports);
+    return ports;
+  }
+
+  /**
+   * Bind the SystemVerilog port-connection markers
+   * (`__sv_conn__<instLine>|<instCol>|<key>|<net>`) into `connects` edges, and
+   * consume the per-module port-order markers (`__sv_portlist__a|b|c`) they need
+   * for positional resolution. Returns the number of `connects` edges created.
+   *
+   * This is the edge that crosses the module wall. The ACTUAL (the net in the
+   * instantiating module) binds module-scoped, exactly like a drive marker; the
+   * FORMAL (the port as declared in the instantiated module) binds by looking up
+   * the already-resolved `instantiates` edge for this instantiation site and
+   * then finding the port by name inside the module it points at.
+   *
+   * Direction encodes DATAFLOW, so there is one edge kind rather than two:
+   *   input  -> actual drives formal   (source = net,  target = port)
+   *   output -> formal drives actual   (source = port, target = net)
+   *   inout  -> recorded actual->formal and tagged `bidirectional`, because a
+   *             bus has no single direction and forcing one would misrepresent
+   *             the connectivity.
+   *
+   * A marker that binds neither end is DROPPED, not guessed: the actual may be
+   * an implicit net that was never declared, and the child module may not be in
+   * the index at all (a vendor cell). Silent beats wrong.
+   */
+  resolveSvConnectEdges(): number {
+    const CONN = '__sv_conn__'; // mirrors SV_CONN_PREFIX in the extractor
+    const PORTLIST = '__sv_portlist__'; // mirrors SV_PORTLIST_PREFIX
+
+    const refs = this.queries.getUnresolvedReferences();
+    type RefKey = { fromNodeId: string; referenceName: string; referenceKind: string };
+    const key = (ref: UnresolvedReference): RefKey => ({
+      fromNodeId: ref.fromNodeId,
+      referenceName: ref.referenceName,
+      referenceKind: ref.referenceKind,
+    });
+    const consumed = new Map<string, RefKey>();
+
+    // Port ORDER, published by each module about itself. Collected first so a
+    // positional connection can resolve its ordinals regardless of file order.
+    const portOrder = new Map<string, string[]>();
+    for (const ref of refs) {
+      if (ref.referenceKind !== 'references' || !ref.referenceName.startsWith(PORTLIST)) continue;
+      consumed.set(`${ref.fromNodeId}|${ref.referenceName}`, key(ref));
+      portOrder.set(ref.fromNodeId, ref.referenceName.slice(PORTLIST.length).split('|'));
+    }
+
+    const conns = refs.filter(
+      (ref) => ref.referenceKind === 'connects' && ref.referenceName.startsWith(CONN)
+    );
+    if (conns.length === 0) {
+      if (consumed.size > 0) this.queries.deleteSpecificResolvedReferences([...consumed.values()]);
+      return 0;
+    }
+
+    // Group by instantiation SITE: every marker in a group shares one child
+    // module, one port map and one wildcard expansion.
+    type Conn = { ref: UnresolvedReference; port: string; net: string };
+    const sites = new Map<string, { parent: string; line: number; column: number; items: Conn[] }>();
+    for (const ref of conns) {
+      consumed.set(`${ref.fromNodeId}|${ref.referenceName}`, key(ref));
+      const body = ref.referenceName.slice(CONN.length);
+      const parts = body.split('|');
+      if (parts.length < 4) continue; // malformed marker: drop it
+      const line = Number(parts[0]);
+      const column = Number(parts[1]);
+      if (!Number.isFinite(line) || !Number.isFinite(column)) continue;
+      // A net name cannot contain `|`, but rejoining the tail rather than
+      // taking parts[3] keeps a malformed marker from silently truncating.
+      const port = parts[2]!;
+      const net = parts.slice(3).join('|');
+      const siteKey = `${ref.fromNodeId}|${line}|${column}`;
+      let site = sites.get(siteKey);
+      if (!site) {
+        site = { parent: ref.fromNodeId, line, column, items: [] };
+        sites.set(siteKey, site);
+      }
+      site.items.push({ ref, port, net });
+    }
+
+    const edges: Edge[] = [];
+    const membersByScope = new Map<string, Map<string, string>>();
+    const portsByModule = new Map<string, Map<string, { id: string; direction: string }>>();
+
+    for (const site of sites.values()) {
+      // The instantiation edge at this exact site names the child module. It is
+      // matched by SITE rather than by module name because a parent can
+      // instantiate several children, and only this site says which one.
+      const inst = this.queries
+        .getOutgoingEdges(site.parent, ['instantiates'])
+        .find((e) => e.line === site.line && e.column === site.column);
+      if (!inst) continue; // child module not in the index (vendor cell) -> drop
+      const child = this.queries.getNodeById(inst.target);
+      if (!child) continue;
+      const instance = (inst.metadata as { instance?: string } | undefined)?.instance;
+
+      const ports = this.buildPortMap(child.id, portsByModule);
+      const actuals = this.buildMemberMap(site.parent, membersByScope);
+      const order = portOrder.get(child.id) ?? [];
+
+      // Resolve each marker's KEY to a formal port name first, so the wildcard
+      // expansion below can subtract what was named explicitly.
+      const resolved: { conn: Conn; port: string }[] = [];
+      let wildcard: Conn | undefined;
+      for (const conn of site.items) {
+        if (conn.port === '*') {
+          wildcard = conn;
+        } else if (conn.port.startsWith('#')) {
+          const ordinal = Number(conn.port.slice(1));
+          const name = Number.isFinite(ordinal) ? order[ordinal] : undefined;
+          if (name) resolved.push({ conn, port: name });
+        } else {
+          resolved.push({ conn, port: conn.port });
+        }
+      }
+
+      // `.*` wires every port not named explicitly to the parent's same-named
+      // net. Expanding it here rather than at extraction time is the whole
+      // reason the child's port list is published: this is another file's
+      // information.
+      if (wildcard) {
+        const named = new Set(resolved.map((r) => r.port));
+        for (const name of order) {
+          if (!name || named.has(name)) continue;
+          resolved.push({ conn: { ref: wildcard.ref, port: name, net: name }, port: name });
+        }
+      }
+
+      for (const { conn, port } of resolved) {
+        const formal = ports.get(port);
+        const actual = actuals.get(conn.net);
+        if (!formal || !actual) continue; // undeclared net or unknown port -> drop
+        const outward = formal.direction === 'output';
+        edges.push({
+          source: outward ? formal.id : actual,
+          target: outward ? actual : formal.id,
+          kind: 'connects',
+          line: conn.ref.line,
+          column: conn.ref.column,
+          provenance: 'tree-sitter',
+          metadata: {
+            port,
+            portDirection: formal.direction,
+            ...(instance ? { instance } : {}),
+            ...(formal.direction === 'inout' ? { bidirectional: true } : {}),
+          },
+        });
+      }
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    if (consumed.size > 0) this.queries.deleteSpecificResolvedReferences([...consumed.values()]);
+    return edges.length;
+  }
+
   /**
    * Bind the SystemVerilog factory-create and TLM-connect markers emitted by
    * the extractor (`__sv_create__<handle>__<Type>`, `__sv_connect__<from>__<to>`).
@@ -2433,8 +2626,12 @@ export class ReferenceResolver {
       const svDrv = this.resolveSvDriveEdges();
       if (svDrv > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svDrv;
       // Instance names ride on edges the generic pass already created, so this
-      // annotates rather than resolves — it adds no edges and no stats.
+      // annotates rather than resolves — it adds no edges and no stats. It must
+      // run BEFORE the connect pass, which reads the instance name off the
+      // instantiation edge to label each connection.
       this.resolveSvInstanceNames();
+      const svConn = this.resolveSvConnectEdges();
+      if (svConn > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svConn;
     } catch {
       // additive and optional; never fail the index on it
     }

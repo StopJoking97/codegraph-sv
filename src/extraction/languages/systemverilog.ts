@@ -566,6 +566,184 @@ function instanceLabel(hierInstance: SyntaxNode, source: string): string | undef
   return id ? getNodeText(id, source).trim() : undefined;
 }
 
+// -- Port connections: what is this instance port actually wired to? ----------
+//
+// The graph knew a parent instantiates a child and knew the child declares a
+// port; it did not know which net in the parent is wired to which port on the
+// child. Every drive edge stopped at the module wall, so tracing a clock from
+// pad to flop still meant opening files. This is the edge that crosses the wall
+// and turns a symbol table into a netlist.
+//
+// Vocabulary (pinned, see docs/agents/domain.md): the ACTUAL is the net in the
+// instantiating module; the FORMAL is the port as declared inside the
+// instantiated module. They are not interchangeable, and a `connects` edge
+// exists to relate exactly those two things across a module boundary.
+//
+// The formal lives in ANOTHER FILE, so extraction can only emit a marker naming
+// the instantiation site, the port (or its ordinal) and the actual; the SV
+// post-pass binds both ends once every module is in the graph.
+const SV_CONN_PREFIX = '__sv_conn__';
+
+// The instantiated module's PORT ORDER, needed to resolve a positional
+// connection, is also another file's information. Each module publishes its own
+// ordered port-name list as a marker on itself; the connect pass consumes and
+// drops them.
+//
+// Sorting the child's port NODES by line/column would be wrong for a non-ANSI
+// module: `module m(a, y); output y; input a;` declares its ports in header
+// order `a, y` but its direction declarations in the opposite order, so a
+// positional connection would bind to the wrong port -- a silently wrong
+// answer, which is the one outcome this feature set refuses to produce.
+const SV_PORTLIST_PREFIX = '__sv_portlist__';
+
+/**
+ * The declared port names of a module, in POSITIONAL order.
+ *
+ *   - ANSI     `module m(input a, output y);`        -> ansi_port_declaration order
+ *   - non-ANSI `module m(a, y); input a; output y;`  -> the HEADER's list_of_ports
+ *
+ * Empty for a module with no port list. A non-ANSI header names its ports and
+ * nothing else, which is exactly the positional contract; the direction
+ * declarations inside the body may appear in any order and are not consulted.
+ * A port whose name cannot be read still occupies its slot as an empty string,
+ * so it never shifts the ordinals after it.
+ */
+function modulePortOrder(moduleDecl: SyntaxNode, source: string): string[] {
+  for (let i = 0; i < moduleDecl.namedChildCount; i++) {
+    const header = moduleDecl.namedChild(i);
+    if (!header) continue;
+
+    if (header.type === 'module_ansi_header') {
+      const list = childrenOfType(header, 'list_of_port_declarations')[0];
+      if (!list) return [];
+      return childrenOfType(list, 'ansi_port_declaration').map((decl) => {
+        const id = getChildByField(decl, 'port_name');
+        return id ? getNodeText(id, source).trim() : '';
+      });
+    }
+
+    if (header.type === 'module_nonansi_header') {
+      const list = childrenOfType(header, 'list_of_ports')[0];
+      if (!list) return [];
+      return childrenOfType(list, 'port').map((port) => {
+        const id = childrenOfType(port, 'simple_identifier')[0];
+        return id ? getNodeText(id, source).trim() : '';
+      });
+    }
+  }
+  return [];
+}
+
+/**
+ * Every net named by a connection's actual expression, in source order.
+ *
+ * A bare net (`.d(data)`), an expression actual (`.d({2'b0, data[3:2]})`) and an
+ * indexed actual (`.d(bus[sel])`) all reduce to the same thing: the
+ * hierarchical_identifiers under the expression. A literal contributes none,
+ * which is why `.clk(1'b0)` produces no edge.
+ *
+ * A MULTI-segment hierarchical actual (`dut.core.sig`) is skipped: its target
+ * lives in another module, which module-scoped binding cannot reach, and
+ * guessing by last segment would invent edges.
+ */
+function collectActualIds(node: SyntaxNode, out: SyntaxNode[], depth = 0): void {
+  if (depth > 16) return; // wiring expressions are shallow; bound the walk
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const c = node.namedChild(i);
+    if (!c) continue;
+    if (c.type === 'hierarchical_identifier') {
+      const ids = childrenOfType(c, 'simple_identifier');
+      if (ids.length === 1 && ids[0]) out.push(ids[0]);
+      continue; // never descend into a hierarchical id's own segments
+    }
+    collectActualIds(c, out, depth + 1);
+  }
+}
+
+/**
+ * Emit the port-connection markers for one `hierarchical_instance`.
+ *
+ * The marker name is `__sv_conn__<instLine>|<instCol>|<key>|<net>`:
+ *   - the instantiation SITE is in the NAME, not just in the ref's line/column,
+ *     because the marker delete key is (source, name, kind) -- two instances of
+ *     the same child wired to the same net on the same port would otherwise
+ *     share one key and one of them would be dropped;
+ *   - `<key>` is the port name for a named connection, `#<n>` for a positional
+ *     one, and `*` for a wildcard, whose expansion needs the child's port list
+ *     and therefore belongs to the post-pass;
+ *   - `|` is the separator because it cannot occur in an SV identifier, while
+ *     `__` legally can (`cfg__db`).
+ *
+ * Positional ordinals are counted by COMMA, not by node index: a skipped
+ * connection (`u (a, , c)`) produces no `ordered_port_connection` node at all,
+ * so index-based counting would silently shift every later port by one.
+ */
+function emitConnectMarkers(hierInstance: SyntaxNode, ctx: ExtractorContext): void {
+  const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (!fromId) return;
+  const list = childrenOfType(hierInstance, 'list_of_port_connections')[0];
+  if (!list) return;
+
+  const instLine = hierInstance.startPosition.row + 1;
+  const instCol = hierInstance.startPosition.column;
+  const emit = (key: string, net: string, site: SyntaxNode): void => {
+    ctx.addUnresolvedReference({
+      fromNodeId: fromId,
+      referenceName: `${SV_CONN_PREFIX}${instLine}|${instCol}|${key}|${net}`,
+      referenceKind: 'connects',
+      line: site.startPosition.row + 1,
+      column: site.startPosition.column,
+    });
+  };
+
+  let ordinal = 0;
+  for (let i = 0; i < list.childCount; i++) {
+    const c = list.child(i);
+    if (!c) continue;
+    if (!c.isNamed) {
+      if (c.type === ',') ordinal++;
+      continue;
+    }
+
+    if (c.type === 'named_port_connection') {
+      const portId = childrenOfType(c, 'simple_identifier')[0];
+      if (!portId) {
+        // No identifier at all -- this is `.*`. Its expansion needs the child's
+        // port list, so the marker defers it to the post-pass rather than
+        // letting it read as "no connections".
+        if (getNodeText(c, ctx.source).includes('*')) emit('*', '', c);
+        continue;
+      }
+      const port = getNodeText(portId, ctx.source).trim();
+      const expr = childrenOfType(c, 'expression')[0];
+      if (expr) {
+        const ids: SyntaxNode[] = [];
+        collectActualIds(expr, ids);
+        for (const id of ids) {
+          const net = getNodeText(id, ctx.source).trim();
+          if (net) emit(port, net, c);
+        }
+        continue;
+      }
+      // No expression child. Two different forms parse identically here and
+      // only the raw text tells them apart:
+      //   `.clk`   implicit named -> wired to the parent's same-named net
+      //   `.y()`   unconnected    -> deliberately floating, so no edge
+      if (!getNodeText(c, ctx.source).includes('(')) emit(port, port, c);
+      continue;
+    }
+
+    if (c.type === 'ordered_port_connection') {
+      const ids: SyntaxNode[] = [];
+      collectActualIds(c, ids);
+      for (const id of ids) {
+        const net = getNodeText(id, ctx.source).trim();
+        if (net) emit(`#${ordinal}`, net, c);
+      }
+    }
+  }
+}
+
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
@@ -782,6 +960,21 @@ export const systemverilogExtractor: LanguageExtractor = {
       const created = ctx.createNode(kind, name, node);
       if (!created) return true;
       ctx.pushScope(created.id);
+      // Publish this module's POSITIONAL port order so a positional
+      // instantiation in another file can resolve its ordinals. Consumed and
+      // dropped by the connect pass; a portless module publishes nothing.
+      if (MODULE_NODES.has(t)) {
+        const ports = modulePortOrder(node, ctx.source);
+        if (ports.length > 0) {
+          ctx.addUnresolvedReference({
+            fromNodeId: created.id,
+            referenceName: `${SV_PORTLIST_PREFIX}${ports.join('|')}`,
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+      }
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child) ctx.visitNode(child);
@@ -829,6 +1022,7 @@ export const systemverilogExtractor: LanguageExtractor = {
               column,
             });
           }
+          if (site !== node) emitConnectMarkers(site, ctx);
         }
       }
       return false; // keep walking: port-connection expressions may contain calls

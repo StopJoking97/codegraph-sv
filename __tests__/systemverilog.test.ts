@@ -1167,6 +1167,255 @@ endmodule
   });
 });
 
+describe('SystemVerilog port-connection edges (across the module wall)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-conn-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  /**
+   * Every connects edge as `<sourceQName> -> <targetQName> [<instance>.<port>
+   * <dir>] @L<line>`, sorted. Qualified names carry the module, so an edge that
+   * crossed the wall to the wrong module's port is visible in the string.
+   */
+  function connectionsOf(graph: CodeGraph): string[] {
+    const out: string[] = [];
+    for (const node of graph.getNodesByKind('field')) {
+      for (const e of graph.getOutgoingEdges(node.id)) {
+        if (e.kind !== 'connects') continue;
+        const m = (e.metadata ?? {}) as {
+          port?: string;
+          portDirection?: string;
+          instance?: string;
+          bidirectional?: boolean;
+        };
+        const target = graph.getNode(e.target);
+        out.push(
+          `${node.qualifiedName} -> ${target?.qualifiedName ?? e.target}` +
+            ` [${m.instance ?? '?'}.${m.port ?? '?'} ${m.portDirection ?? '?'}` +
+            `${m.bidirectional ? ' bidi' : ''}] @L${e.line}`
+        );
+      }
+    }
+    return out.sort();
+  }
+
+  const CHILD = `
+module child(input clk, input [3:0] d, output y, inout sda);
+  assign y = |d;
+endmodule
+`;
+
+  it('emits one edge per named connection, directed by the port direction', async () => {
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire sys_clk, out1, sda_bus;
+  wire [3:0] data;
+  child u_a (.clk(sys_clk), .d(data), .y(out1), .sda(sda_bus));
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([
+      // inputs: the actual drives the formal
+      'top::data -> child::d [u_a.d input] @L5',
+      'top::sda_bus -> child::sda [u_a.sda inout bidi] @L5',
+      'top::sys_clk -> child::clk [u_a.clk input] @L5',
+      // output: the formal drives the actual
+      'child::y -> top::out1 [u_a.y output] @L5',
+    ].sort());
+  });
+
+  it('resolves positional connections, and a skipped one does not shift the rest', async () => {
+    // `child u (sys_clk, , out1, sda_bus)` leaves port 1 (`d`) unconnected.
+    // The grammar emits NO node for the empty slot, so counting connections by
+    // node index would bind `out1` to `d` and `sda_bus` to `y`.
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire sys_clk, out1, sda_bus;
+  child u_p (sys_clk, , out1, sda_bus);
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([
+      'top::sda_bus -> child::sda [u_p.sda inout bidi] @L4',
+      'top::sys_clk -> child::clk [u_p.clk input] @L4',
+      'child::y -> top::out1 [u_p.y output] @L4',
+    ].sort());
+  });
+
+  it('resolves positional connections against a non-ANSI header, not declaration order', async () => {
+    // The header order is (a, y); the direction declarations are in the OPPOSITE
+    // order. Sorting the child's port nodes by line would bind both backwards.
+    cg = await indexFiles({
+      'leaf.v': `
+module leaf_na(a, y);
+  output y;
+  input a;
+  assign y = ~a;
+endmodule
+`,
+      'top.v': `
+module top;
+  wire src, dst;
+  leaf_na u_n (src, dst);
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([
+      'top::src -> leaf_na::a [u_n.a input] @L4',
+      'leaf_na::y -> top::dst [u_n.y output] @L4',
+    ].sort());
+  });
+
+  it('treats `.clk` as implicit-named and `.y()` as unconnected', async () => {
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire clk, d, sda;
+  child u_i (.clk, .d, .y(), .sda(sda));
+endmodule
+`,
+    });
+    // `.y()` is deliberately floating, so no edge — the two forms parse
+    // identically and only the parentheses tell them apart.
+    expect(connectionsOf(cg!)).toEqual([
+      'top::clk -> child::clk [u_i.clk input] @L4',
+      'top::d -> child::d [u_i.d input] @L4',
+      'top::sda -> child::sda [u_i.sda inout bidi] @L4',
+    ].sort());
+  });
+
+  it('records every net of an expression actual and no edge for a literal', async () => {
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire lo, hi, sda_bus;
+  child u_e (.clk(1'b0), .d({lo, hi}), .y(), .sda(sda_bus));
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([
+      'top::hi -> child::d [u_e.d input] @L4',
+      'top::lo -> child::d [u_e.d input] @L4',
+      'top::sda_bus -> child::sda [u_e.sda inout bidi] @L4',
+    ].sort());
+  });
+
+  it('expands a wildcard connection against the child port list', async () => {
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire clk, y, sda;
+  wire [3:0] d;
+  child u_w (.*);
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([
+      'top::clk -> child::clk [u_w.clk input] @L5',
+      'top::d -> child::d [u_w.d input] @L5',
+      'top::sda -> child::sda [u_w.sda inout bidi] @L5',
+      'child::y -> top::y [u_w.y output] @L5',
+    ].sort());
+  });
+
+  it('binds the formal to the PORT, not to a net re-declared to drive it', async () => {
+    // Legacy Verilog re-declares an output as a reg so a procedural block can
+    // write it, leaving two same-named members. A last-write-wins member lookup
+    // binds the connection to the internal register instead of to the port.
+    cg = await indexFiles({
+      'leaf.v': `
+module leaf_reg(y);
+  output y;
+  reg y;
+  initial y = 1'b0;
+endmodule
+`,
+      'top.v': `
+module top;
+  wire dst;
+  leaf_reg u_r (.y(dst));
+endmodule
+`,
+    });
+    const edges = connectionsOf(cg!);
+    expect(edges).toEqual(['leaf_reg::y -> top::dst [u_r.y output] @L4']);
+    // The port and the driving register are distinct nodes; the edge must start
+    // at the one carrying the direction decorator.
+    const source = cg!
+      .getNodesByKind('field')
+      .filter((n) => n.name === 'y' && n.filePath === 'leaf.v');
+    expect(source.length).toBe(2);
+  });
+
+  it('keeps two instantiations of the same child on the same net distinct', async () => {
+    // Both connections share a scope, a port name and a net name. If the marker
+    // did not carry its instantiation site, the delete key would collapse them
+    // and one would be lost.
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire sys_clk;
+  child u_1 (.clk(sys_clk));
+  child u_2 (.clk(sys_clk));
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([
+      'top::sys_clk -> child::clk [u_1.clk input] @L4',
+      'top::sys_clk -> child::clk [u_2.clk input] @L5',
+    ]);
+  });
+
+  it('drops a connection whose child module is not indexed, and leaves no marker', async () => {
+    cg = await indexFiles({
+      'top.v': `
+module top;
+  wire sys_clk;
+  vendor_cell u_v (.clk(sys_clk));
+endmodule
+`,
+    });
+    expect(connectionsOf(cg!)).toEqual([]);
+
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_conn__%' OR reference_name LIKE '__sv_portlist__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    expect(left).toEqual([]);
+  });
+});
+
 describe('SystemVerilog driver edges — module-scoped binding', () => {
   let tempDir: string;
   let cg: CodeGraph | undefined;

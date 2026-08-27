@@ -297,7 +297,12 @@ export class GraphTraverser {
     // it. Deliberately NOT added to getCallees below: a module drives hundreds
     // of signals, and flooding its callee list would bury the instantiation
     // hierarchy that makes a module's callees worth reading.
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'drives']);
+    // `connects` is the same question one module wall further out: for a formal
+    // port the caller is the actual net wired to it, and for a net fed by a
+    // child's output the caller is that output port. Unlike `drives` its
+    // endpoints are SIGNALS, never the enclosing module, so it cannot collide
+    // with a drive edge in the visited set below.
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'drives', 'connects']);
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
