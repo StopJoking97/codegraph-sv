@@ -2178,6 +2178,50 @@ export class ReferenceResolver {
     return edges.length;
   }
 
+  /**
+   * Run the eight SystemVerilog marker passes, in dependency order, and return
+   * the number of edges they created.
+   *
+   * These are the ONLY producers of `drives`, `reads`, `connects`, `hier_ref`
+   * and macro edges, so anything that resolves references has to call this or
+   * the SV half of the graph silently disappears. It used to live inline in
+   * `resolveAndPersistBatched` alone, which meant an incremental `sync` — the
+   * watcher's path, and the CLI's — re-extracted a changed SV file, parked its
+   * markers `status='failed'` through the generic resolver, and never ran a
+   * single SV pass over them. The file's drives/reads and its input-direction
+   * connects vanished until the next full index, while output-direction
+   * connects survived via the cross-file edge reattachment: a half-graph that
+   * looks complete.
+   *
+   * Safe to call repeatedly. Every pass CONSUMES the markers it binds (the rows
+   * are deleted), so a second run over an unchanged index finds nothing and
+   * emits nothing; only freshly re-extracted markers produce edges. The passes
+   * read `getUnresolvedReferences()`, which has no status filter, so markers
+   * parked `status='failed'` by a scoped resolution pass are still visible here.
+   */
+  runSvPostPasses(): number {
+    let edges = 0;
+    try {
+      edges += this.resolveSvHandleCalls();
+      edges += this.resolveSvHdlEdges();
+      edges += this.resolveSvDriveEdges();
+      // Instance names ride on edges the generic pass already created, so this
+      // annotates rather than resolves — it adds no edges and no stats. It must
+      // run BEFORE the connect pass, which reads the instance name off the
+      // instantiation edge to label each connection.
+      this.resolveSvInstanceNames();
+      edges += this.resolveSvConnectEdges();
+      edges += this.resolveSvReadEdges();
+      // Walks instance names recorded by the instance pass and module hierarchy
+      // already persisted by the generic pass.
+      edges += this.resolveSvHierRefEdges();
+      edges += this.resolveSvMacroEdges();
+    } catch {
+      // additive and optional; never fail the index on it
+    }
+    return edges;
+  }
+
   /** Port directions, which are also the decorators an extracted SV port carries. */
   private static readonly SV_PORT_DIRECTIONS: ReadonlySet<string> = new Set([
     'input',
@@ -2220,9 +2264,12 @@ export class ReferenceResolver {
 
   /**
    * Bind the SystemVerilog port-connection markers
-   * (`__sv_conn__<instLine>|<instCol>|<key>|<net>`) into `connects` edges, and
-   * consume the per-module port-order markers (`__sv_portlist__a|b|c`) they need
-   * for positional resolution. Returns the number of `connects` edges created.
+   * (`__sv_conn__<instLine>|<instCol>|<key>|<net>`) into `connects` edges, using
+   * the per-module port-order markers (`__sv_portlist__a|b|c`) for positional
+   * and `.*` resolution. Returns the number of `connects` edges created.
+   *
+   * The connection markers are consumed; the port-order markers are NOT — see
+   * the note on `portOrder` below for why that asymmetry is load-bearing.
    *
    * This is the edge that crosses the module wall. The ACTUAL (the net in the
    * instantiating module) binds module-scoped, exactly like a drive marker; the
@@ -2256,20 +2303,33 @@ export class ReferenceResolver {
 
     // Port ORDER, published by each module about itself. Collected first so a
     // positional connection can resolve its ordinals regardless of file order.
+    //
+    // This marker is DURABLE, not consumed. It is a standing fact about the
+    // module — its header order — and the only record of it: port order is not
+    // recoverable from the port nodes, because a non-ANSI header declares the
+    // order in the header (`module m(a, y);`) while the port NODES are created
+    // at the body direction declarations (`output y; input a;`), which may be in
+    // any order. Sorting the port nodes by position binds such a module's
+    // positional connections BACKWARDS.
+    //
+    // Consuming it made it single-use, and that is what broke incremental sync:
+    // the child's marker was deleted at the first index, so when only the PARENT
+    // was later re-extracted there was no port order left and every positional
+    // and `.*` connection was silently dropped — permanently, until a full
+    // re-index. Leaving the row in place costs one row per module and makes the
+    // fact re-readable by every later resolution run. The row is replaced
+    // naturally when the module's own file is re-extracted (its refs cascade on
+    // delete), so it can never go stale.
     const portOrder = new Map<string, string[]>();
     for (const ref of refs) {
       if (ref.referenceKind !== 'references' || !ref.referenceName.startsWith(PORTLIST)) continue;
-      consumed.set(`${ref.fromNodeId}|${ref.referenceName}`, key(ref));
       portOrder.set(ref.fromNodeId, ref.referenceName.slice(PORTLIST.length).split('|'));
     }
 
     const conns = refs.filter(
       (ref) => ref.referenceKind === 'connects' && ref.referenceName.startsWith(CONN)
     );
-    if (conns.length === 0) {
-      if (consumed.size > 0) this.queries.deleteSpecificResolvedReferences([...consumed.values()]);
-      return 0;
-    }
+    if (conns.length === 0) return 0; // nothing to bind; the portlist rows stay
 
     // Group by instantiation SITE: every marker in a group shares one child
     // module, one port map and one wildcard expansion.
@@ -3013,30 +3073,10 @@ export class ReferenceResolver {
 
     // Bind SystemVerilog this./super. calls now that the extends + contains
     // edges are all persisted (these refs were preserved above for this pass).
-    try {
-      const svBound = this.resolveSvHandleCalls();
-      if (svBound > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svBound;
-      const svHdl = this.resolveSvHdlEdges();
-      if (svHdl > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHdl;
-      const svDrv = this.resolveSvDriveEdges();
-      if (svDrv > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svDrv;
-      // Instance names ride on edges the generic pass already created, so this
-      // annotates rather than resolves — it adds no edges and no stats. It must
-      // run BEFORE the connect pass, which reads the instance name off the
-      // instantiation edge to label each connection.
-      this.resolveSvInstanceNames();
-      const svConn = this.resolveSvConnectEdges();
-      if (svConn > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svConn;
-      const svRead = this.resolveSvReadEdges();
-      if (svRead > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svRead;
-      // Last of the SV passes: it walks instance names recorded by the instance
-      // pass and module hierarchy already persisted by the generic pass.
-      const svHier = this.resolveSvHierRefEdges();
-      if (svHier > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHier;
-      const svMacro = this.resolveSvMacroEdges();
-      if (svMacro > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svMacro;
-    } catch {
-      // additive and optional; never fail the index on it
+    const svEdges = this.runSvPostPasses();
+    if (svEdges > 0) {
+      aggregateStats.byMethod['qualified-name'] =
+        (aggregateStats.byMethod['qualified-name'] || 0) + svEdges;
     }
 
     // Dynamic-edge synthesis: now that all base `calls` edges are persisted,

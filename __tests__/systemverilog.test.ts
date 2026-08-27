@@ -1244,6 +1244,50 @@ endmodule
     ].sort());
   });
 
+  it('rebuilds named, positional and wildcard connections after an incremental sync', async () => {
+    // Editing the PARENT re-extracts only the parent. Two defects met here:
+    // sync never ran the SV post-passes at all (so every input-direction
+    // connection vanished, while output-direction ones survived through the
+    // cross-file edge reattachment — a half-graph that looks whole), and the
+    // child's `__sv_portlist__` marker was consumed at the first index, so even
+    // once the passes ran there was no port order left and the positional and
+    // `.*` connections could never come back without a full re-index.
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire clk, d, y, sda;
+  child u_named (.clk(clk), .d(d), .y(y), .sda(sda));
+  child u_pos (clk, d, y, sda);
+  child u_wild (.*);
+endmodule
+`,
+    });
+    const before = connectionsOf(cg!);
+    // All three instantiations bind all four ports.
+    expect(before.length).toBe(12);
+
+    // A comment-only edit: same ports, same nets, one extra line.
+    fs.writeFileSync(
+      path.join(tempDir, 'top.v'),
+      `
+// touched
+module top;
+  wire clk, d, y, sda;
+  child u_named (.clk(clk), .d(d), .y(y), .sda(sda));
+  child u_pos (clk, d, y, sda);
+  child u_wild (.*);
+endmodule
+`
+    );
+    await cg!.sync();
+
+    // Every connection returns, each shifted by the one inserted line.
+    expect(connectionsOf(cg!)).toEqual(
+      before.map((s) => s.replace(/@L(\d+)$/, (_, n) => `@L${Number(n) + 1}`)).sort()
+    );
+  });
+
   it('resolves positional connections, and a skipped one does not shift the rest', async () => {
     // `child u (sys_clk, , out1, sda_bus)` leaves port 1 (`d`) unconnected.
     // The grammar emits NO node for the empty slot, so counting connections by
@@ -1559,11 +1603,11 @@ endmodule
     // Add a second read BELOW the first. INSERT OR IGNORE against the identity
     // index would keep the old one-element list forever.
     //
-    // A FULL re-index, not sync(): the incremental path resolves only the
-    // changed files' refs through the generic resolver and never runs the SV
-    // post-passes at all, so it drops `drives` the same way it drops `reads`.
-    // That is a pre-existing limitation of every SV marker pass, out of scope
-    // here.
+    // Through sync(), the INCREMENTAL path — the watcher's and the CLI's. It
+    // used to drop the SV edges entirely (the generic resolver parks the markers
+    // status='failed' and the batched path that runs the SV passes is
+    // unreachable from the scoped branch), so this test had to re-index in full
+    // to say anything. sync() now runs the SV post-passes itself.
     fs.writeFileSync(
       path.join(tempDir, 'grow.v'),
       `
@@ -1575,8 +1619,7 @@ module grow(input en, output reg x, output reg y);
 endmodule
 `
     );
-    await cg!.indexAll();
-    cg!.resolveReferences();
+    await cg!.sync();
     expect(readersOf(cg!, 'en', 'grow.v')).toEqual(['grow@[4,5]']);
   });
 

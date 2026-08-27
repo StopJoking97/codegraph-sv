@@ -39,6 +39,7 @@ import {
   IndexProgress,
   IndexResult,
   SyncResult,
+  detectLanguage,
   extractFromSource,
   initGrammars,
 } from './extraction';
@@ -890,6 +891,25 @@ export class CodeGraph {
               });
             }
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-failed-ref-retry: ${Date.now() - tRetry}ms (${retryable.length} refs)`);
+
+            // SystemVerilog post-passes. The generic resolver above cannot bind
+            // the SV markers — resolveOne returns null for them, so it parks
+            // every one as status='failed' — and the batched path that normally
+            // runs these passes is unreachable from here (this scoped branch is
+            // taken whenever changedFilePaths is set, and the orphan sweep below
+            // gates on the PENDING count, which a completed scoped pass leaves
+            // at zero). Without this call a synced SV file loses its drives,
+            // reads and input-direction connects until the next full index,
+            // while output-direction connects survive through the cross-file
+            // edge reattachment — a half-graph that reads as a complete one.
+            //
+            // Gated on an SV file actually having changed so no other language's
+            // repo pays for eight full-table marker scans on every sync.
+            if (result.changedFilePaths.some((p) => detectLanguage(p) === 'systemverilog')) {
+              const tSv = Date.now();
+              const svEdges = this.resolver.runSvPostPasses();
+              if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-sv-post-passes: ${Date.now() - tSv}ms (${svEdges} edges)`);
+            }
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();

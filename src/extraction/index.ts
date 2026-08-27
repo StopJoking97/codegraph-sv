@@ -2602,6 +2602,19 @@ export class ExtractionOrchestrator {
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
+      // An OUTPUT-direction SystemVerilog port connection points from the
+      // child's port INTO the instantiating parent's net, so an incoming one
+      // means the file being re-indexed is the PARENT — the module whose
+      // `__sv_conn__` markers were just re-extracted and which the connect pass
+      // is about to rebuild this edge from. Re-attaching it too would leave two
+      // edges for one connection, the stale copy still carrying the
+      // pre-edit instantiation line. Input/inout connections are the mirror
+      // case (incoming means this file is the CHILD, and the marker lives in
+      // the parent, which was NOT re-extracted), so those must still re-attach
+      // or they are lost until a full re-index.
+      if (e.kind === 'connects' && (e.metadata as { portDirection?: string } | undefined)?.portDirection === 'output') {
+        continue;
+      }
       const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
