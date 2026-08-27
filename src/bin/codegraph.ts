@@ -1975,10 +1975,20 @@ program
           timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
         });
 
-        if (options.json) console.log(JSON.stringify(outcome, null, 2));
-        else console.log('\n' + formatVerifyReport(outcome, options.strict) + '\n');
-
         const code = verifyExitCode(outcome, options.strict);
+
+        // The text renderer spells out what a run did and did not measure; the
+        // JSON branch used to hand back the raw outcome and leave the reader to
+        // re-derive the verdict from it. It carries the same conclusion now, so
+        // a script cannot read a NOT-MEASURED run as a clean one.
+        if (options.json) {
+          console.log(
+            JSON.stringify({ ...outcome, strict: !!options.strict, exitCode: code, verdict: code === 0 ? 'pass' : 'fail' }, null, 2)
+          );
+        } else {
+          console.log('\n' + formatVerifyReport(outcome, options.strict) + '\n');
+        }
+
         if (code !== 0) process.exit(code);
       } finally {
         cg.destroy();

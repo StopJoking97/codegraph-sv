@@ -372,6 +372,7 @@ describe('verify — degradation paths (no grader installed)', () => {
       reason: 'pyslang is not installed (pip install "pyslang==11.*")',
       staleFiles: [],
       scopedFiles: 41,
+      indexedFiles: 41,
     };
     const text = formatVerifyReport(outcome);
     expect(text).toContain('SKIPPED');
@@ -390,6 +391,7 @@ describe('verify — degradation paths (no grader installed)', () => {
       reason: 'pyslang is not installed (pip install "pyslang==11.*")',
       staleFiles: [],
       scopedFiles: 41,
+      indexedFiles: 41,
     };
     expect(verifyExitCode(outcome, true)).toBe(1);
     const text = formatVerifyReport(outcome, true);
@@ -407,6 +409,7 @@ describe('verify — degradation paths (no grader installed)', () => {
       reason: 'pyslang is not installed',
       staleFiles: ['sim/old_tb.sv'],
       scopedFiles: 41,
+      indexedFiles: 41,
     });
     expect(text).toContain('STALE');
     expect(text).toContain('sim/old_tb.sv');
@@ -415,7 +418,18 @@ describe('verify — degradation paths (no grader installed)', () => {
 
 describe('verify — report rendering and exit codes', () => {
   const okOutcome = (
-    over: Partial<{ missing: number; unexplained: number; configured: boolean; version: string; notes: string[]; graded: number }> = {}
+    over: Partial<{
+      missing: number;
+      unexplained: number;
+      configured: boolean;
+      version: string;
+      notes: string[];
+      graded: number;
+      scopedFiles: number;
+      indexedFiles: number;
+      gradedFiles: number;
+      minCoverage: number;
+    }> = {}
   ) => {
     const missing = over.missing ?? 0;
     const graded = over.graded ?? 10;
@@ -456,7 +470,10 @@ describe('verify — report rendering and exit codes', () => {
       },
       result: summarize(files),
       staleFiles: [],
-      scopedFiles: 1,
+      scopedFiles: over.scopedFiles ?? 1,
+      indexedFiles: over.indexedFiles ?? 1,
+      gradedFiles: over.gradedFiles ?? 1,
+      minCoverage: over.minCoverage ?? 1,
       configured: over.configured ?? true,
       parseFailed: [],
     };
@@ -503,6 +520,73 @@ describe('verify — report rendering and exit codes', () => {
     // UNEXPLAINED is a tripwire for the classifier, not a recall bug, so it does
     // not fail the build on its own.
     expect(verifyExitCode(okOutcome({ unexplained: 3 }), true)).toBe(0);
+  });
+
+  it('does NOT fail a project that holds no SystemVerilog, in either mode', () => {
+    // The regression the zero-graded gate introduced. `verify` grades
+    // SystemVerilog and nothing else, so a TypeScript repo scopes zero files and
+    // grades zero declarations — arithmetically identical to the emptied
+    // population it was written to catch, and every non-SV project became a
+    // permanent red under --strict. What separates them is whether there was
+    // ever anything to measure.
+    const nothingToVerify = okOutcome({
+      graded: 0,
+      scopedFiles: 0,
+      indexedFiles: 0,
+      gradedFiles: 0,
+    });
+    expect(verifyExitCode(nothingToVerify, true)).toBe(0);
+    expect(verifyExitCode(nothingToVerify, false)).toBe(0);
+
+    const text = formatVerifyReport(nothingToVerify, true);
+    expect(text).toContain('NOTHING TO VERIFY');
+    // And it must not read as evidence either.
+    expect(text).not.toContain('100.0%');
+  });
+
+  it('FAILS under --strict when the config kept every SystemVerilog file out of scope', () => {
+    // The mirror of the case above and the reason the two zeroes cannot share a
+    // test: SystemVerilog IS indexed here, and an exclude glob is the thing that
+    // emptied the population. That run owes exactly the evidence it skipped.
+    const excludedAway = okOutcome({
+      graded: 0,
+      scopedFiles: 0,
+      indexedFiles: 41,
+      gradedFiles: 0,
+    });
+    expect(verifyExitCode(excludedAway, true)).toBe(1);
+    expect(verifyExitCode(excludedAway, false)).toBe(0);
+  });
+
+  it('FAILS under --strict when the oracle graded a fraction of the files it was given', () => {
+    // A run proves only as much as it covered. Emptying the population was
+    // already caught; NARROWING it was not — 1 file of 41 graded scored a clean
+    // 100.0% and exited 0, indistinguishable from a full pass.
+    const narrowed = okOutcome({ scopedFiles: 41, indexedFiles: 41, gradedFiles: 1 });
+    expect(verifyExitCode(narrowed, true)).toBe(1);
+    expect(verifyExitCode(narrowed, false)).toBe(0);
+
+    // The report has to say which, not just fail.
+    const text = formatVerifyReport(narrowed, true);
+    expect(text).toContain('COVERAGE  1 / 41');
+    expect(text).toContain('40 came back with no verdict');
+
+    // Full coverage of the same scope passes.
+    expect(verifyExitCode(okOutcome({ scopedFiles: 41, indexedFiles: 41, gradedFiles: 41 }), true)).toBe(0);
+  });
+
+  it('honours a project-configured coverage floor below 1', () => {
+    // A corpus with files the oracle genuinely cannot take needs a way to say so
+    // that is louder than deleting the check.
+    const half = { scopedFiles: 41, indexedFiles: 41, gradedFiles: 21 };
+    expect(verifyExitCode(okOutcome({ ...half, minCoverage: 1 }), true)).toBe(1);
+    expect(verifyExitCode(okOutcome({ ...half, minCoverage: 0.5 }), true)).toBe(0);
+  });
+
+  it('states how much of the index the scope covered, so a narrowed run cannot read as a full one', () => {
+    const text = formatVerifyReport(okOutcome({ scopedFiles: 12, indexedFiles: 41, gradedFiles: 12 }));
+    expect(text).toContain('scoped: 12 of 41 SystemVerilog files');
+    expect(text).toContain('narrowed by verify.include/exclude');
   });
 
   it('FAILS a zero-graded run under --strict instead of scoring it 100%', () => {

@@ -111,6 +111,11 @@ export interface ProjectConfig {
     include?: string[];
     /** Gitignore-style patterns dropping paths from the graded set. */
     exclude?: string[];
+    /**
+     * Share of scoped files the oracle must grade before `--strict` passes,
+     * as a fraction in [0, 1]. Defaults to 1.
+     */
+    minCoverage?: number;
   };
 }
 
@@ -120,6 +125,19 @@ export interface VerifyConfig {
   defines: Record<string, string>;
   include: string[];
   exclude: string[];
+  /**
+   * The share of scoped files the oracle must actually GRADE before `--strict`
+   * will pass, as a fraction in [0, 1]. Default 1: grade everything you were
+   * asked to grade.
+   *
+   * `--strict` already refuses a run that graded nothing, but a run that graded
+   * SOMETHING proves only as much as it covered. A file the oracle was handed
+   * and then failed to parse leaves a hole no recall percentage can show,
+   * because the percentage is computed over what survived. The default says
+   * that hole is a failure; lower it when a corpus has files the oracle
+   * genuinely cannot take.
+   */
+  minCoverage: number;
   /** False when no `verify` block was present — the pass reports the mode. */
   configured: boolean;
 }
@@ -149,11 +167,14 @@ const cache = new Map<string, CacheEntry>();
 
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
+const DEFAULT_VERIFY_MIN_COVERAGE = 1;
+
 const EMPTY_VERIFY: VerifyConfig = Object.freeze({
   includeDirs: Object.freeze([]) as unknown as string[],
   defines: Object.freeze({}) as Record<string, string>,
   include: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
+  minCoverage: DEFAULT_VERIFY_MIN_COVERAGE,
   configured: false,
 });
 
@@ -488,6 +509,23 @@ function extractVerify(parsed: object, file: string): VerifyConfig {
     }
   }
 
+  // A coverage floor is a fraction, so anything outside [0, 1] — including the
+  // "90" someone means as 90% — is a misunderstanding, not a preference.
+  // Warning and keeping the default is the safe direction: it can only make
+  // --strict harder to pass, never quietly softer than the author intended.
+  let minCoverage = DEFAULT_VERIFY_MIN_COVERAGE;
+  if (raw.minCoverage !== undefined) {
+    const v = raw.minCoverage;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+      logWarn(
+        `Ignoring verify.minCoverage in ${PROJECT_CONFIG_FILENAME}: expected a number between 0 and 1`,
+        { file }
+      );
+    } else {
+      minCoverage = v;
+    }
+  }
+
   const includeDirs = strings(raw.includeDirs, 'includeDirs');
   const include = strings(raw.include, 'include');
   const exclude = strings(raw.exclude, 'exclude');
@@ -495,11 +533,12 @@ function extractVerify(parsed: object, file: string): VerifyConfig {
     includeDirs.length === 0 &&
     include.length === 0 &&
     exclude.length === 0 &&
-    Object.keys(defines).length === 0
+    Object.keys(defines).length === 0 &&
+    raw.minCoverage === undefined
   ) {
     return EMPTY_VERIFY;
   }
-  return { includeDirs, defines, include, exclude, configured: true };
+  return { includeDirs, defines, include, exclude, minCoverage, configured: true };
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

@@ -93,6 +93,13 @@ export type VerifyOutcome =
       /** Stale entries are found without the grader, so they still report. */
       staleFiles: string[];
       scopedFiles: number;
+      /**
+       * SystemVerilog files in the index BEFORE the config's globs narrow it.
+       * The discriminator between the two zeroes: a project holding no
+       * SystemVerilog owes no evidence, while a project whose config excluded
+       * all of its SystemVerilog owes exactly the evidence it just skipped.
+       */
+      indexedFiles: number;
     }
   | {
       status: 'ok';
@@ -100,6 +107,11 @@ export type VerifyOutcome =
       result: ClassifyResult;
       staleFiles: string[];
       scopedFiles: number;
+      indexedFiles: number;
+      /** Files the oracle actually returned a verdict for. */
+      gradedFiles: number;
+      /** The project's coverage floor for `--strict` (fraction of scoped). */
+      minCoverage: number;
       /** True when the project supplied include dirs / defines / globs. */
       configured: boolean;
       /** Files the grader could not parse at all. */
@@ -168,7 +180,13 @@ export function verifyIndex(
   });
 
   if (outcome.status === 'skipped') {
-    return { status: 'skipped', reason: outcome.reason, staleFiles, scopedFiles: scoped.length };
+    return {
+      status: 'skipped',
+      reason: outcome.reason,
+      staleFiles,
+      scopedFiles: scoped.length,
+      indexedFiles: indexedPaths.length,
+    };
   }
 
   // What the index holds, per file: name → declaration line.
@@ -225,6 +243,9 @@ export function verifyIndex(
     result: summarize(verdicts),
     staleFiles,
     scopedFiles: scoped.length,
+    indexedFiles: indexedPaths.length,
+    gradedFiles: Object.keys(outcome.report.files).length,
+    minCoverage: config.minCoverage,
     configured: config.configured,
     parseFailed: outcome.report.parseFailed,
   };
@@ -264,8 +285,31 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
     lines.push('  mode: SYNTAX-ONLY — no `verify` block in codegraph.json, so no include path and no defines.');
     lines.push('        Files that depend on headers are graded loosely; add includeDirs/defines to tighten it.');
   }
-  lines.push(`  scoped: ${outcome.scopedFiles} SystemVerilog files in the index; ${Object.keys(report.files).length} graded`);
+  // File coverage, stated before the recall figure so the figure is read
+  // against what it actually covered. A recall percentage over one file out of
+  // forty-one looks exactly like one over all forty-one.
+  lines.push(
+    `  scoped: ${outcome.scopedFiles} of ${outcome.indexedFiles} SystemVerilog files in the index` +
+      `${outcome.scopedFiles < outcome.indexedFiles ? ' (narrowed by verify.include/exclude)' : ''}` +
+      `; ${outcome.gradedFiles} graded`
+  );
+  if (outcome.scopedFiles > 0 && outcome.gradedFiles < outcome.scopedFiles) {
+    const floor = Math.ceil(outcome.scopedFiles * outcome.minCoverage);
+    lines.push(
+      `  COVERAGE  ${outcome.gradedFiles} / ${outcome.scopedFiles} scoped files graded` +
+        ` — ${outcome.scopedFiles - outcome.gradedFiles} came back with no verdict.` +
+        ` --strict requires ${floor} (verify.minCoverage ${outcome.minCoverage}).`
+    );
+  }
   lines.push('');
+
+  if (outcome.indexedFiles === 0) {
+    lines.push('  NOTHING TO VERIFY — the index holds no SystemVerilog.');
+    lines.push('  `codegraph verify` grades SystemVerilog against an independent front-end and');
+    lines.push('  has nothing to say about any other language. This is not a pass and not a');
+    lines.push('  failure: there was no measurement to make, so --strict does not block on it.');
+    return lines.join('\n');
+  }
 
   // A ratio over an empty population is not 100% — it is no measurement. Print
   // the absence rather than a perfect score the run did not earn.
@@ -273,8 +317,7 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
     lines.push('  DESIGN-SCOPE RECALL   0 / 0   NOT MEASURED — the graded population is EMPTY.');
     lines.push('  The oracle ran but produced no declaration to grade, so this run says');
     lines.push('  nothing about the index. Usual causes: every scoped file was excluded by a');
-    lines.push('  `verify.exclude` glob, the index holds no SystemVerilog, or the grader could');
-    lines.push('  not parse anything it was given.');
+    lines.push('  `verify.exclude` glob, or the grader could not parse anything it was given.');
   } else {
     const pct = (100 * result.hit) / result.graded;
     lines.push(`  DESIGN-SCOPE RECALL   ${result.hit} / ${result.graded}   ${pct.toFixed(1)}%`);
@@ -344,16 +387,37 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
  * Process exit code for an outcome.
  *
  * Default mode never blocks: 0 for everything. `--strict` is the opposite
- * contract — it fails on a real MISSING, on a skip (the oracle never ran), and
- * on a graded population of zero (the oracle ran but measured nothing). The
- * last two are the false-green: without them a CI image that loses pyslang, or
- * an exclude glob that empties the population, exits 0 forever while proving
+ * contract — "prove it" — and the exit code has to distinguish evidence from
+ * the absence of evidence. It fails on a real MISSING, on a skip (the oracle
+ * never ran), on a graded population of zero, on a config that excluded every
+ * SystemVerilog file the index holds, and on a run that graded a smaller share
+ * of its scope than `verify.minCoverage` allows. Without those a CI image that
+ * loses pyslang, or an exclude glob, greens the gate forever while proving
  * nothing.
+ *
+ * The one thing --strict must NOT do is fail a project that owes no evidence.
+ * `verify` grades SystemVerilog and nothing else, so a repo that holds none
+ * scopes zero files and grades zero declarations — arithmetically identical to
+ * the emptied-population false-green, and the reason a bare `graded === 0` test
+ * turned every non-SystemVerilog project into a permanent red. `indexedFiles`
+ * is what separates them: no SystemVerilog in the index means there was never a
+ * measurement to make, and a gate that fires there is just wrong about a
+ * TypeScript repo forever.
  */
 export function verifyExitCode(outcome: VerifyOutcome, strict = false): number {
   if (!strict) return 0;
+  // Nothing to verify — not a failure, and not a pass anyone should read as
+  // evidence either. The report says so in words; the exit code stays out of
+  // the way.
+  if (outcome.indexedFiles === 0) return 0;
   if (outcome.status === 'skipped') return 1;
+  // SystemVerilog exists but the config kept all of it out of scope.
+  if (outcome.scopedFiles === 0) return 1;
   if (outcome.result.graded === 0) return 1;
+  // A run proves only as much as it covered. Files handed to the oracle that
+  // came back with no verdict are a hole the recall percentage cannot show,
+  // because the percentage is computed over what survived.
+  if (outcome.gradedFiles < outcome.scopedFiles * outcome.minCoverage) return 1;
   return outcome.result.missing > 0 ? 1 : 0;
 }
 
