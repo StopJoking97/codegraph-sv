@@ -63,20 +63,21 @@ export type GraderOutcome =
   | { status: 'skipped'; reason: string };
 
 /**
- * Where the bundled oracle script lives.
+ * Where the bundled oracle script lives — always beside this module.
  *
- * ONE candidate, deliberately. This module sits two levels below its root in
- * both layouts — `dist/verify/grader.js` in a published package and
- * `src/verify/grader.ts` under vitest/tsx — so `../../scripts/sv/` resolves to
- * `<pkg>/scripts/sv/` either way. (`package.json`'s `files` array ships
- * `scripts`, so the published package carries it.)
+ * It sits in `src/verify/` and `copy-assets` (npm `build`) copies it to
+ * `dist/verify/`, so `__dirname` resolves it in a published package, in the
+ * bundled release, and under vitest/tsx alike. Keeping it beside its only
+ * caller is what makes that true: the release bundle stages `dist/` and nothing
+ * else (`scripts/build-bundle.sh`), so an asset living under `scripts/` would be
+ * absent from the channel most users actually install — the feature would ship
+ * dead while every from-source test passed.
  *
- * A third-level fallback would resolve ABOVE the package root, where it could
- * only ever match somebody else's file — and this path is handed straight to
- * `spawnSync`. Not finding the script is the correct outcome there.
+ * Per CLAUDE.md: any new non-TS asset must be added to `copy-assets` or it will
+ * not ship.
  */
 export function oracleScriptPath(): string | null {
-  const candidate = path.join(__dirname, '..', '..', 'scripts', 'sv', 'slang-oracle.py');
+  const candidate = path.join(__dirname, 'slang-oracle.py');
   try {
     if (fs.existsSync(candidate)) return path.resolve(candidate);
   } catch {
@@ -90,6 +91,66 @@ function pythonCandidates(): string[] {
   const override = process.env.CODEGRAPH_VERIFY_PYTHON;
   if (override) return [override];
   return process.platform === 'win32' ? ['python', 'py', 'python3'] : ['python3', 'python'];
+}
+
+/**
+ * Turn a finished oracle process into an outcome.
+ *
+ * Split out of `runGrader` so the degradation paths that depend only on what the
+ * child SAID — a missing pyslang, output this build cannot parse, a protocol it
+ * does not speak — are reachable from a test without spawning anything. They are
+ * the paths hardest to provoke through a real interpreter and the ones that must
+ * never throw, which is exactly the combination that leaves a path untested.
+ */
+export function interpretGraderOutput(
+  exitStatus: number | null,
+  stdout: string,
+  stderr: string
+): GraderOutcome {
+  if (exitStatus === 2) {
+    return { status: 'skipped', reason: 'pyslang is not installed (pip install "pyslang==11.*")' };
+  }
+  if (exitStatus !== 0) {
+    const tail = (stderr || '').trim().split('\n').slice(-3).join(' ');
+    return { status: 'skipped', reason: `the oracle exited with ${exitStatus}${tail ? `: ${tail}` : ''}` };
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(stdout) as Record<string, unknown>;
+  } catch {
+    return { status: 'skipped', reason: 'the oracle produced output this build could not parse' };
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { status: 'skipped', reason: 'the oracle produced output this build could not parse' };
+  }
+  if (parsed.protocol !== ORACLE_PROTOCOL) {
+    return {
+      status: 'skipped',
+      reason: `the oracle speaks protocol ${String(parsed.protocol)}, this build speaks ${ORACLE_PROTOCOL}`,
+    };
+  }
+
+  const version = String(parsed.version ?? 'unknown');
+  const major = Number(version.split('.')[0]);
+  const versionWarning = SUPPORTED_ORACLE_MAJORS.includes(major)
+    ? undefined
+    : `pyslang ${version} is outside the validated range (${SUPPORTED_ORACLE_MAJORS.map((m) => `${m}.x`).join(', ')}); ` +
+      'the graded population may be smaller than it looks, so treat a perfect score as unproven';
+
+  return {
+    status: 'ok',
+    report: {
+      oracle: String(parsed.oracle ?? 'unknown'),
+      version,
+      mode: parsed.mode === 'preprocessed' ? 'preprocessed' : 'syntax-only',
+      notes: (parsed.notes ?? []) as string[],
+      files: (parsed.files ?? {}) as Record<string, GradedFile>,
+      parseFailed: (parsed.parseFailed ?? []) as string[],
+      notOnDisk: (parsed.notOnDisk ?? []) as string[],
+      versionWarning,
+    },
+  };
 }
 
 /**
@@ -140,47 +201,7 @@ export function runGrader(job: GraderJob): GraderOutcome {
     if (result.signal) {
       return { status: 'skipped', reason: `the oracle was killed (${result.signal}) — likely the ${job.timeoutMs}ms timeout` };
     }
-    if (result.status === 2) {
-      return { status: 'skipped', reason: 'pyslang is not installed (pip install "pyslang==11.*")' };
-    }
-    if (result.status !== 0) {
-      const stderr = (result.stderr || '').trim().split('\n').slice(-3).join(' ');
-      return { status: 'skipped', reason: `the oracle exited with ${result.status}${stderr ? `: ${stderr}` : ''}` };
-    }
-
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(result.stdout) as Record<string, unknown>;
-    } catch {
-      return { status: 'skipped', reason: 'the oracle produced output this build could not parse' };
-    }
-    if (parsed.protocol !== ORACLE_PROTOCOL) {
-      return {
-        status: 'skipped',
-        reason: `the oracle speaks protocol ${String(parsed.protocol)}, this build speaks ${ORACLE_PROTOCOL}`,
-      };
-    }
-
-    const version = String(parsed.version ?? 'unknown');
-    const major = Number(version.split('.')[0]);
-    const versionWarning = SUPPORTED_ORACLE_MAJORS.includes(major)
-      ? undefined
-      : `pyslang ${version} is outside the validated range (${SUPPORTED_ORACLE_MAJORS.map((m) => `${m}.x`).join(', ')}); ` +
-        'the graded population may be smaller than it looks, so treat a perfect score as unproven';
-
-    return {
-      status: 'ok',
-      report: {
-        oracle: String(parsed.oracle ?? 'unknown'),
-        version,
-        mode: parsed.mode === 'preprocessed' ? 'preprocessed' : 'syntax-only',
-        notes: (parsed.notes ?? []) as string[],
-        files: (parsed.files ?? {}) as Record<string, GradedFile>,
-        parseFailed: (parsed.parseFailed ?? []) as string[],
-        notOnDisk: (parsed.notOnDisk ?? []) as string[],
-        versionWarning,
-      },
-    };
+    return interpretGraderOutput(result.status, result.stdout, result.stderr);
   }
 
   return { status: 'skipped', reason: lastReason };

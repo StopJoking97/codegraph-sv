@@ -20,6 +20,7 @@ import {
   formatVerifyReport,
   verifyExitCode,
   runGrader,
+  interpretGraderOutput,
   oracleScriptPath,
   ORACLE_PROTOCOL,
   SUPPORTED_ORACLE_MAJORS,
@@ -308,6 +309,61 @@ describe('verify — degradation paths (no grader installed)', () => {
       if (saved === undefined) delete process.env.CODEGRAPH_VERIFY_PYTHON;
       else process.env.CODEGRAPH_VERIFY_PYTHON = saved;
     }
+  });
+
+  it('skips when pyslang itself is missing, naming the install command', () => {
+    // The oracle exits 2 for exactly this, so a teammate who has Python but not
+    // pyslang gets an actionable line instead of a stack trace.
+    const outcome = interpretGraderOutput(2, '', 'pyslang is not importable');
+    expect(outcome.status).toBe('skipped');
+    if (outcome.status === 'skipped') expect(outcome.reason).toContain('pip install');
+  });
+
+  it('skips on output this build cannot parse', () => {
+    for (const junk of ['not json at all', '', '[1,2,3]', 'null']) {
+      const outcome = interpretGraderOutput(0, junk, '');
+      expect(outcome.status, junk).toBe('skipped');
+    }
+  });
+
+  it('skips on a protocol this build does not speak, naming both versions', () => {
+    // A future oracle whose wire shape changed must not be read with this
+    // build's assumptions — a mis-read report is worse than no report.
+    const outcome = interpretGraderOutput(0, JSON.stringify({ protocol: 99, files: {} }), '');
+    expect(outcome.status).toBe('skipped');
+    if (outcome.status === 'skipped') {
+      expect(outcome.reason).toContain('99');
+      expect(outcome.reason).toContain(String(ORACLE_PROTOCOL));
+    }
+  });
+
+  it('carries the last of stderr into the reason on a non-zero exit', () => {
+    const outcome = interpretGraderOutput(7, '', 'line one\nline two\nboom');
+    expect(outcome.status).toBe('skipped');
+    if (outcome.status === 'skipped') expect(outcome.reason).toContain('boom');
+  });
+
+  it('accepts a well-formed report, and flags an unvalidated oracle version', () => {
+    const ok = interpretGraderOutput(
+      0,
+      JSON.stringify({ protocol: ORACLE_PROTOCOL, oracle: 'pyslang', version: `${SUPPORTED_ORACLE_MAJORS[0]}.0.0`, mode: 'preprocessed', files: {} }),
+      ''
+    );
+    expect(ok.status).toBe('ok');
+    if (ok.status === 'ok') {
+      expect(ok.report.mode).toBe('preprocessed');
+      expect(ok.report.versionWarning).toBeUndefined();
+    }
+
+    const future = interpretGraderOutput(
+      0,
+      JSON.stringify({ protocol: ORACLE_PROTOCOL, version: '99.1.0', files: {} }),
+      ''
+    );
+    // A version bump is REPORTED, never fatal: the risk it carries is a silently
+    // smaller graded population, which the reader has to be told about.
+    expect(future.status).toBe('ok');
+    if (future.status === 'ok') expect(future.report.versionWarning).toContain('99.1.0');
   });
 
   it('renders a skip as guidance, and its exit code is SUCCESS', () => {
