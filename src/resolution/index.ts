@@ -1702,7 +1702,12 @@ export class ReferenceResolver {
         referenceKind: ref.referenceKind,
       });
 
-      const members = this.buildMemberMap(ref.fromNodeId, membersByScope);
+      // `skipDecorator` keeps a module-scoped `` `define `` from shadowing a
+      // same-named signal: both land as `constant`/`field` children of the same
+      // scope, and a driver answer must be about the SIGNAL.
+      const members = this.buildMemberMap(ref.fromNodeId, membersByScope, {
+        skipDecorator: ReferenceResolver.SV_MACRO_DECORATOR,
+      });
 
       const target = members.get(ref.referenceName.slice(PREFIX.length));
       if (!target) continue; // implicit net or cross-module hierarchical write
@@ -1833,7 +1838,11 @@ export class ReferenceResolver {
         referenceKind: ref.referenceKind,
       });
 
-      const members = this.buildMemberMap(ref.fromNodeId, membersByScope);
+      // Same reason as the drive pass: a reader answer must be about the SIGNAL,
+      // never a same-named macro definition in the same scope.
+      const members = this.buildMemberMap(ref.fromNodeId, membersByScope, {
+        skipDecorator: ReferenceResolver.SV_MACRO_DECORATOR,
+      });
       const target = members.get(ref.referenceName.slice(PREFIX.length));
       if (!target) continue; // implicit net or out-of-scope name
 
@@ -2030,6 +2039,90 @@ export class ReferenceResolver {
           ...(isWrite ? { hierarchical: true } : {}),
         },
       });
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    if (deleteKeys.size > 0) this.queries.deleteSpecificResolvedReferences([...deleteKeys.values()]);
+    return edges.length;
+  }
+
+  /**
+   * The decorator marking a `constant` node as a `` `define `` rather than a
+   * parameter. Mirrors SV_MACRO_DECORATOR in the extractor.
+   */
+  private static readonly SV_MACRO_DECORATOR = 'macro';
+
+  /**
+   * Bind the SystemVerilog macro-use markers (`__sv_macro__<NAME>`) to the
+   * `` `define `` nodes that declare them. Returns the number of `references`
+   * edges created.
+   *
+   * Binding is GLOBAL by name, unlike every other SystemVerilog marker pass. A
+   * macro is a preprocessor symbol with no scope at all — it is visible from the
+   * point of definition to the end of the compilation unit, across file
+   * boundaries — so module-scoped binding would resolve almost none of them.
+   *
+   * A name defined in MORE THAN ONE place produces an edge to EVERY definition
+   * site. Real designs define one macro name in
+   * two different files with no principled winner; binding to a first match
+   * would invent an answer that changes with row order. Showing both is the
+   * honest answer, and it is the one an engineer needs — the ambiguity is the
+   * finding.
+   *
+   * A marker that matches no definition is DISCARDED, not guessed. That is the
+   * safety valve for a stray backtick in ordinary RTL producing a spurious
+   * macro-use node: it must fabricate nothing.
+   */
+  resolveSvMacroEdges(): number {
+    const PREFIX = '__sv_macro__'; // mirrors SV_MACRO_PREFIX in the extractor
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'references' && ref.referenceName.startsWith(PREFIX));
+    if (candidates.length === 0) return 0;
+
+    // name -> every definition site. Built once for the whole pass.
+    const definitions = new Map<string, string[]>();
+    const definitionsFor = (name: string): string[] => {
+      const cached = definitions.get(name);
+      if (cached) return cached;
+      const ids = this.queries
+        .getNodesByName(name)
+        .filter(
+          (n) =>
+            n.kind === 'constant' &&
+            n.language === 'systemverilog' &&
+            n.decorators?.includes(ReferenceResolver.SV_MACRO_DECORATOR)
+        )
+        .map((n) => n.id);
+      definitions.set(name, ids);
+      return ids;
+    };
+
+    const edges: Edge[] = [];
+    const deleteKeys = new Map<
+      string,
+      { fromNodeId: string; referenceName: string; referenceKind: string }
+    >();
+
+    for (const ref of candidates) {
+      deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
+        fromNodeId: ref.fromNodeId,
+        referenceName: ref.referenceName,
+        referenceKind: ref.referenceKind,
+      });
+      const name = ref.referenceName.slice(PREFIX.length);
+      for (const target of definitionsFor(name)) {
+        if (target === ref.fromNodeId) continue; // a define referencing itself is noise
+        edges.push({
+          source: ref.fromNodeId,
+          target,
+          kind: 'references',
+          line: ref.line,
+          column: ref.column,
+          provenance: 'tree-sitter',
+          metadata: { macro: name },
+        });
+      }
     }
 
     if (edges.length > 0) this.queries.insertEdges(edges);
@@ -2892,6 +2985,8 @@ export class ReferenceResolver {
       // pass and module hierarchy already persisted by the generic pass.
       const svHier = this.resolveSvHierRefEdges();
       if (svHier > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHier;
+      const svMacro = this.resolveSvMacroEdges();
+      if (svMacro > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svMacro;
     } catch {
       // additive and optional; never fail the index on it
     }

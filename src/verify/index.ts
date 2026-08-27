@@ -37,6 +37,19 @@ import {
   type IndexedFile,
 } from './classify';
 
+/**
+ * The decorator marking a `constant` node as a `` `define `` rather than a
+ * parameter (mirrors SV_MACRO_DECORATOR in the SystemVerilog extractor).
+ *
+ * A preprocessor symbol is NOT a declaration: slang consumes `` `define `` during
+ * preprocessing, so a macro name can never appear in the graded population no
+ * matter how the oracle is configured. Leaving macros in would make every one of
+ * them fire the UNEXPLAINED tripwire — a real design can carry many —
+ * which is a population error, not a finding. Excluding them states the
+ * population correctly; it does not weaken the tripwire.
+ */
+const MACRO_DECORATOR = 'macro';
+
 /** Node kinds the grader's declaration population is comparable to. */
 const GRADED_NODE_KINDS = [
   'field',
@@ -148,18 +161,37 @@ export function verifyIndex(
   }
 
   // What the index holds, per file: name → declaration line.
-  const indexedByFile = new Map<string, IndexedFile>();
+  //
+  // A name is dropped only when EVERY node carrying it in that file is a macro.
+  // A `` `define `` and a same-named signal can coexist, and dropping the name
+  // outright would turn the signal into a false MISSING.
+  const staged = new Map<string, Map<string, { line: number; macroOnly: boolean }>>();
   for (const kind of GRADED_NODE_KINDS) {
     for (const node of queries.iterateNodesByKind(kind)) {
       if (node.language !== 'systemverilog') continue;
       const rel = norm(node.filePath);
-      let entry = indexedByFile.get(rel);
+      let entry = staged.get(rel);
       if (!entry) {
         entry = new Map();
-        indexedByFile.set(rel, entry);
+        staged.set(rel, entry);
       }
-      if (!entry.has(node.name)) entry.set(node.name, node.startLine);
+      const isMacro = node.decorators?.includes(MACRO_DECORATOR) === true;
+      const existing = entry.get(node.name);
+      if (!existing) {
+        entry.set(node.name, { line: node.startLine, macroOnly: isMacro });
+      } else if (existing.macroOnly && !isMacro) {
+        // A real declaration outranks the macro that got here first.
+        entry.set(node.name, { line: node.startLine, macroOnly: false });
+      }
     }
+  }
+  const indexedByFile = new Map<string, IndexedFile>();
+  for (const [rel, entry] of staged) {
+    const kept: IndexedFile = new Map();
+    for (const [name, v] of entry) {
+      if (!v.macroOnly) kept.set(name, v.line);
+    }
+    indexedByFile.set(rel, kept);
   }
 
   const verdicts = [];

@@ -1889,6 +1889,207 @@ endmodule
   });
 });
 
+describe('SystemVerilog macro definitions and uses', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-macro-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  /** `<name>@<file>:<line> = <signature>` for every macro definition node. */
+  function macrosIn(graph: CodeGraph): string[] {
+    return graph
+      .getNodesByKind('constant')
+      .filter((n) => n.decorators?.includes('macro'))
+      .map((n) => `${n.name}@${n.filePath}:${n.startLine} = ${n.signature ?? ''}`)
+      .sort();
+  }
+
+  /** `<file>:<line> -> <macro>@<defFile>:<defLine>` for every macro use edge. */
+  function macroUses(graph: CodeGraph): string[] {
+    const out: string[] = [];
+    for (const def of graph.getNodesByKind('constant')) {
+      if (!def.decorators?.includes('macro')) continue;
+      for (const e of graph.getIncomingEdges(def.id)) {
+        if (e.kind !== 'references') continue;
+        const src = graph.getNode(e.source);
+        out.push(`${src?.filePath ?? '?'}:${e.line} -> ${def.name}@${def.filePath}:${def.startLine}`);
+      }
+    }
+    return out.sort();
+  }
+
+  it('makes each `define a node carrying its value and a macro decorator', async () => {
+    cg = await indexFiles({
+      'defs.vh': `
+\`define WIDTH 8
+\`define NOP
+\`define ADDR_MAX (1<<\`WIDTH)
+`,
+    });
+    expect(macrosIn(cg!)).toEqual([
+      'ADDR_MAX@defs.vh:4 = `define ADDR_MAX (1<<`WIDTH)',
+      'NOP@defs.vh:3 = `define NOP',
+      'WIDTH@defs.vh:2 = `define WIDTH 8',
+    ]);
+  });
+
+  it('emits an edge from each use to its definition, across files', async () => {
+    cg = await indexFiles({
+      'defs.vh': `
+\`define WIDTH 8
+`,
+      'top.v': `
+module top;
+  wire [\`WIDTH-1:0] bus;
+  localparam MAX = \`WIDTH;
+endmodule
+`,
+    });
+    expect(macroUses(cg!)).toEqual([
+      'top.v:3 -> WIDTH@defs.vh:2',
+      'top.v:4 -> WIDTH@defs.vh:2',
+    ]);
+  });
+
+  it('edges to EVERY definition when a name is defined more than once', async () => {
+    // Real designs define one macro name in two
+    // different files with no principled winner. Binding to a first match
+    // invents an answer that changes with row order; showing both IS the answer.
+    cg = await indexFiles({
+      'a.vh': `\n\`define TRUE 1'b1\n`,
+      'b.vh': `\n\`define TRUE 1\n`,
+      'top.v': `
+module top;
+  localparam T = \`TRUE;
+endmodule
+`,
+    });
+    expect(macroUses(cg!)).toEqual([
+      'top.v:3 -> TRUE@a.vh:2',
+      'top.v:3 -> TRUE@b.vh:2',
+    ]);
+  });
+
+  it('resolves a macro named in a conditional-compilation directive', async () => {
+    // The pre-parse blanks directive lines before the grammar sees them (one
+    // directive would otherwise swallow a whole module as an ERROR node), so
+    // these names are captured from the ORIGINAL source during pre-parse.
+    cg = await indexFiles({
+      'defs.vh': `\n\`define FPGA\n`,
+      'top.v': `
+module top;
+\`ifdef FPGA
+  wire fpga_only;
+\`else
+  wire asic_only;
+\`endif
+endmodule
+`,
+    });
+    expect(macroUses(cg!)).toEqual(['top.v:3 -> FPGA@defs.vh:2']);
+    // Both branches still index — that property is what the blanking protects.
+    const nets = cg!.getNodesByKind('field').map((n) => n.name).sort();
+    expect(nets).toEqual(['asic_only', 'fpga_only']);
+  });
+
+  it('never shadows a same-named signal in the driver or reader answers', async () => {
+    // A module-scoped `define and a signal both land as children of the module.
+    // Dataflow answers must stay about the SIGNAL.
+    cg = await indexFiles({
+      'shadow.v': `
+module shadow(input clk, output reg ready);
+\`define ready 1'b1
+  wire src;
+  always @(posedge clk) ready <= src;
+  wire copy = ready;
+endmodule
+`,
+    });
+    const signal = cg!
+      .getNodesByKind('field')
+      .find((n) => n.name === 'ready' && n.filePath === 'shadow.v');
+    expect(signal).toBeDefined();
+
+    const drivers = cg!
+      .getIncomingEdges(signal!.id)
+      .filter((e) => e.kind === 'drives')
+      .map((e) => e.line);
+    expect(drivers).toEqual([5]);
+
+    const readers = cg!
+      .getIncomingEdges(signal!.id)
+      .filter((e) => e.kind === 'reads')
+      .map((e) => (e.metadata as { lines?: number[] } | undefined)?.lines);
+    expect(readers).toEqual([[6]]);
+
+    // The macro node exists, and carries none of the dataflow.
+    const macro = cg!
+      .getNodesByKind('constant')
+      .find((n) => n.name === 'ready' && n.decorators?.includes('macro'));
+    expect(macro).toBeDefined();
+    expect(cg!.getIncomingEdges(macro!.id).filter((e) => e.kind === 'drives' || e.kind === 'reads')).toEqual([]);
+  });
+
+  it('discards an unbindable macro marker rather than fabricating a definition', async () => {
+    cg = await indexFiles({
+      'stray.v': `
+module stray;
+  localparam X = \`NEVER_DEFINED;
+endmodule
+`,
+    });
+    expect(macrosIn(cg!)).toEqual([]);
+    expect(macroUses(cg!)).toEqual([]);
+
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_macro__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    expect(left).toEqual([]);
+  });
+
+  it('keeps reading the identifiers a macro invocation passes as arguments', async () => {
+    // A macro call's arguments are ordinary expressions. Swallowing the usage
+    // subtree would silently drop them from the fanout answer.
+    cg = await indexFiles({
+      'args.v': `
+\`define CHECK(sig) sig
+module args(input clk, input flag, output reg q);
+  always @(posedge clk) q <= \`CHECK(flag);
+endmodule
+`,
+    });
+    const flag = cg!.getNodesByKind('field').find((n) => n.name === 'flag');
+    const lines = cg!
+      .getIncomingEdges(flag!.id)
+      .filter((e) => e.kind === 'reads')
+      .map((e) => (e.metadata as { lines?: number[] } | undefined)?.lines);
+    expect(lines).toEqual([[4]]);
+  });
+});
+
 describe('SystemVerilog driver edges — module-scoped binding', () => {
   let tempDir: string;
   let cg: CodeGraph | undefined;

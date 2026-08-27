@@ -827,11 +827,75 @@ function isLvaluePosition(hierId: SyntaxNode): boolean {
   return t === 'variable_lvalue' || t === 'net_lvalue' || t === 'nonrange_variable_lvalue';
 }
 
+// -- Macros: where is this defined, and who uses it ---------------------------
+//
+// Preprocessor symbols were invisible to the graph, so the value behind a
+// symbolic width or address could only be found by grepping, and the blast
+// radius of changing one could not be assessed at all.
+//
+// No new node kind and no new edge kind: a definition reuses `constant` with a
+// `macro` decorator, and a use reuses the existing `references` relationship —
+// which means both inherit the whole traversal and query surface for free.
+//
+// The decorator is not cosmetic. A module-scoped `` `define `` and a same-named
+// signal both land as `constant`/`field` children of the same scope, so the
+// shared scope-member lookup skips macro-decorated children in the driver and
+// reader passes: dataflow answers must stay about SIGNALS.
+const SV_MACRO_DECORATOR = 'macro';
+const SV_MACRO_PREFIX = '__sv_macro__';
+
+/**
+ * Macro references that appear in a conditional-compilation DIRECTIVE
+ * (`` `ifdef FOO ``), recorded per file during pre-parse.
+ *
+ * They cannot be read from the AST: the grammar has no preprocessor, so the
+ * pre-parse blanks every directive line before the parser sees it — which is
+ * what stops one directive from swallowing a whole module as an ERROR node.
+ * Blanking destroys the macro name along with the directive, so it is captured
+ * from the ORIGINAL source here and drained when the walk reaches the file node.
+ *
+ * Keyed by file path and deleted on drain, so a re-parse of the same file
+ * replaces rather than accumulates, and a parse that never walks leaves at most
+ * one entry behind.
+ */
+const pendingDirectiveMacros = new Map<string, { name: string; line: number; column: number }[]>();
+
+/** Record the `` `ifdef ``/`` `ifndef ``/`` `elsif `` macro names in `source`. */
+function recordDirectiveMacroUses(source: string, filePath?: string): void {
+  if (!filePath || source.indexOf('`') === -1) return;
+  const out: { name: string; line: number; column: number }[] = [];
+  const lines = source.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^[ \t]*`(?:ifndef|ifdef|elsif)[ \t]+([A-Za-z_]\w*)/.exec(lines[i] ?? '');
+    if (m && m[1]) out.push({ name: m[1], line: i + 1, column: m[0].length - m[1].length });
+  }
+  if (out.length > 0) pendingDirectiveMacros.set(filePath, out);
+  else pendingDirectiveMacros.delete(filePath);
+}
+
+/** Take and clear this file's recorded directive macro references. */
+function takeDirectiveMacroUses(filePath: string): { name: string; line: number; column: number }[] {
+  const out = pendingDirectiveMacros.get(filePath);
+  pendingDirectiveMacros.delete(filePath);
+  return out ?? [];
+}
+
+/** Test hook: forget anything pre-parse recorded but no walk drained. */
+export function clearPendingDirectiveMacros(): void {
+  pendingDirectiveMacros.clear();
+}
+
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
 export const systemverilogExtractor: LanguageExtractor = {
-  preParse: blankVerilogConditionalDirectives,
+  // The blanking function stays PURE (it is exported and tested as such); the
+  // side effect that captures directive macro names before they are destroyed
+  // lives here, in the hook.
+  preParse: (source, filePath) => {
+    recordDirectiveMacroUses(source, filePath);
+    return blankVerilogConditionalDirectives(source);
+  },
   // Subroutines. function/task are dual-listed in methodTypes (gated by
   // methodScopeKinds below) so they read as 'method' inside a class but stay
   // 'function' inside a module. class_constructor_declaration ('function new')
@@ -982,6 +1046,71 @@ export const systemverilogExtractor: LanguageExtractor = {
    */
   visitNode: (node: SyntaxNode, ctx: ExtractorContext): boolean => {
     const t = node.type;
+
+    // Macro references recorded during pre-parse, drained once at the file root.
+    // They are emitted from the FILE node because a conditional directive
+    // usually sits outside any module.
+    if (t === 'source_file') {
+      const fileId = ctx.nodeStack[ctx.nodeStack.length - 1];
+      const pending = takeDirectiveMacroUses(ctx.filePath);
+      if (fileId) {
+        for (const use of pending) {
+          ctx.addUnresolvedReference({
+            fromNodeId: fileId,
+            referenceName: `${SV_MACRO_PREFIX}${use.name}`,
+            referenceKind: 'references',
+            line: use.line,
+            column: use.column,
+          });
+        }
+      }
+      return false; // keep walking: the file's real contents follow
+    }
+
+    // `` `define NAME value `` -> a first-class node. Reuses `constant` with a
+    // `macro` decorator rather than adding a node kind, so it inherits every
+    // existing query path.
+    if (t === 'text_macro_definition') {
+      const nameNode = childrenOfType(node, 'text_macro_name')[0];
+      const id = nameNode ? childrenOfType(nameNode, 'simple_identifier')[0] : undefined;
+      if (id) {
+        const name = getNodeText(id, ctx.source).trim();
+        if (name) {
+          const body = childrenOfType(node, 'macro_text')[0];
+          const value = body ? getNodeText(body, ctx.source).replace(/\s+/g, ' ').trim() : '';
+          ctx.createNode('constant', name, id, {
+            signature: value ? `\`define ${name} ${value.length > 120 ? `${value.slice(0, 117)}...` : value}` : `\`define ${name}`,
+            decorators: [SV_MACRO_DECORATOR],
+          });
+        }
+      }
+      return true; // the macro body is text, not code — never walk into it
+    }
+
+    // `` `NAME `` in ordinary code. Bound GLOBALLY by name, unlike every other
+    // SV marker: a macro is a preprocessor symbol with no scope, so module-
+    // scoped binding would resolve almost none of them.
+    if (t === 'text_macro_usage') {
+      const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
+      const id = childrenOfType(node, 'simple_identifier')[0];
+      if (fromId && id) {
+        const name = getNodeText(id, ctx.source).trim();
+        if (name) {
+          ctx.addUnresolvedReference({
+            fromNodeId: fromId,
+            referenceName: `${SV_MACRO_PREFIX}${name}`,
+            referenceKind: 'references',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+      }
+      // Keep walking. A macro invocation can carry ARGUMENTS
+      // (`` `CHECK(sig, 1'b0) ``), and those are ordinary expressions whose
+      // identifiers are genuine reads — swallowing the subtree would silently
+      // drop them from the fanout answer.
+      return false;
+    }
 
     // Reads. This is the FIRST branch of the ladder and the only one that ever
     // fires on a `hierarchical_identifier`, so a later feature that wants to

@@ -133,6 +133,17 @@ describe('verify — three-way classifier', () => {
     expect(v.disagreements).toEqual([]);
   });
 
+  it('does not fire the tripwire on a preprocessor symbol', () => {
+    // A `define is NOT a declaration: slang consumes it during preprocessing, so
+    // a macro name can never enter the graded population no matter how the
+    // oracle is configured. verifyIndex drops macro-only names before
+    // classifying — a real design can carry many — because reporting each
+    // as UNEXPLAINED is a population error, not a finding. The classifier itself
+    // stays honest: anything it IS handed and cannot explain still fires.
+    const v = classifyFile('a.v', { scope: ['clk'], local: [] }, indexed([['clk', 1], ['ghost', 9]]), []);
+    expect(v.disagreements.map((d) => d.verdict)).toEqual(['UNEXPLAINED']);
+  });
+
   it('summarizes per-class totals across files', () => {
     const files: FileVerdict[] = [
       classifyFile('a.v', { scope: ['x', 'y'], local: [] }, indexed([['x', 1]]), []),

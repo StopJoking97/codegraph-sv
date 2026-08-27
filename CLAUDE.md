@@ -67,7 +67,11 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 Defined in `src/types.ts`. Both extractors and resolvers must use these exact strings.
 
 - **NodeKind**: `file`, `module`, `class`, `struct`, `interface`, `trait`, `protocol`, `function`, `method`, `property`, `field`, `variable`, `constant`, `enum`, `enum_member`, `type_alias`, `namespace`, `parameter`, `import`, `export`, `route`, `component`, `union`.
-- **EdgeKind**: `contains`, `calls`, `imports`, `exports`, `extends`, `implements`, `references`, `type_of`, `returns`, `instantiates`, `overrides`, `decorates`.
+- **EdgeKind**: `contains`, `calls`, `imports`, `exports`, `extends`, `implements`, `references`, `type_of`, `returns`, `instantiates`, `overrides`, `decorates`, `drives`, `connects`, `reads`, `hier_ref`.
+
+`EDGE_KINDS` and `NODE_KINDS` are ordered, **append-only** arrays whose INDEX is the on-wire byte value in the kernel's edge/ref rows, and `codegraph-kernel/src/buffers.rs` mirrors both including a fixed-length array literal. Append in build order, change TypeScript and Rust **in the same commit**, and bump the length literal — a desync does not fail loudly, it silently relabels every existing edge of an adjacent kind. `__tests__/edge-kind-wire-contract.test.ts` guards this by reading the Rust SOURCE, so it holds with or without a Rust toolchain (the kernel-scaffold suite skips entirely when the `.node` is not built and therefore cannot be the only guard).
+
+The last four are HDL (SystemVerilog/Verilog) connectivity and dataflow: `drives` (who writes a net), `reads` (who reads it, aggregated per reader/net with the site list in metadata), `connects` (an instance port connection, actual net <-> formal port, direction encoding dataflow), `hier_ref` (a dotted hierarchical path resolved hop by hop).
 
 ### Multi-agent installer
 
