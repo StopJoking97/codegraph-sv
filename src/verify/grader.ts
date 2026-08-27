@@ -62,20 +62,25 @@ export type GraderOutcome =
   | { status: 'ok'; report: GraderReport }
   | { status: 'skipped'; reason: string };
 
-/** Where the bundled oracle script lives, for a built dist AND a source run. */
+/**
+ * Where the bundled oracle script lives.
+ *
+ * ONE candidate, deliberately. This module sits two levels below its root in
+ * both layouts — `dist/verify/grader.js` in a published package and
+ * `src/verify/grader.ts` under vitest/tsx — so `../../scripts/sv/` resolves to
+ * `<pkg>/scripts/sv/` either way. (`package.json`'s `files` array ships
+ * `scripts`, so the published package carries it.)
+ *
+ * A third-level fallback would resolve ABOVE the package root, where it could
+ * only ever match somebody else's file — and this path is handed straight to
+ * `spawnSync`. Not finding the script is the correct outcome there.
+ */
 export function oracleScriptPath(): string | null {
-  const candidates = [
-    // dist/verify/grader.js -> <pkg>/scripts/sv/slang-oracle.py
-    path.join(__dirname, '..', '..', 'scripts', 'sv', 'slang-oracle.py'),
-    // src/verify/grader.ts (vitest, tsx) -> <repo>/scripts/sv/slang-oracle.py
-    path.join(__dirname, '..', '..', '..', 'scripts', 'sv', 'slang-oracle.py'),
-  ];
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(c)) return path.resolve(c);
-    } catch {
-      // An unreadable candidate is just not the one.
-    }
+  const candidate = path.join(__dirname, '..', '..', 'scripts', 'sv', 'slang-oracle.py');
+  try {
+    if (fs.existsSync(candidate)) return path.resolve(candidate);
+  } catch {
+    // An unreadable path is just not the script.
   }
   return null;
 }
