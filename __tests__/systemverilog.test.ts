@@ -1778,6 +1778,94 @@ endmodule
     expect(pathsFrom(cg!, 'tb')).toEqual([]);
   });
 
+  it('reads a local struct-member write as a member select, not a cross-module drive', async () => {
+    // `bus` is a local variable in `a` AND the name of an unrelated module. The
+    // root lookup used to consult the global module table first, so this plain
+    // member write became a confident `drives` edge onto bus::valid — a
+    // fabricated back-door driver, with tree-sitter provenance, in the driver
+    // answer. Common RTL names (bus, ctrl, fifo, core) make the collision routine.
+    cg = await indexFiles({
+      'a.sv': `
+typedef struct packed { logic valid; logic [7:0] data; } bus_t;
+module a;
+  bus_t bus;
+  always_comb bus.valid = 1'b1;
+endmodule
+`,
+      'bus.sv': `
+module bus(input clk, output reg valid);
+  always @(posedge clk) valid <= 1'b1;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'a')).toEqual([]);
+  });
+
+  it('keeps an absolute probe inside its own design when two designs share a top name', async () => {
+    // `module tb` in two designs is routine in verification repos. Binding the
+    // root by global name took the first in file-path order, so design B's probe
+    // reached into design A and drove ITS signal.
+    cg = await indexFiles({
+      'a_tb.sv': `
+module tb_top;
+  dut_a u_dut();
+endmodule
+`,
+      'a_dut.sv': `
+module dut_a;
+  logic sig;
+endmodule
+`,
+      'b_tb.sv': `
+module tb_top;
+  dut_b u_dut();
+  initial force tb_top.u_dut.sig = 1'b0;
+endmodule
+`,
+      'b_dut.sv': `
+module dut_b;
+  logic sig;
+endmodule
+`,
+    });
+    // Resolved against the EMITTING module, so it can only reach dut_b.
+    const paths = cg!
+      .getNodesByKind('module')
+      .filter((n) => n.name === 'tb_top')
+      .flatMap((n) =>
+        cg!
+          .getOutgoingEdges(n.id)
+          .filter((e) => e.kind === 'hier_ref' || (e.kind === 'drives' && (e.metadata as { path?: string })?.path))
+          .map((e) => `${e.kind} -> ${cg!.getNode(e.target)?.qualifiedName}`)
+      );
+    expect(paths).toEqual(['drives -> dut_b::sig']);
+  });
+
+  it('never binds a hierarchical root to a module node from another language', async () => {
+    // terraform and cobol also emit kind 'module', and the name lookup had no
+    // language predicate — so `module "tb_top"` in a .tf file could capture the
+    // root of a SystemVerilog probe purely on file-path sort order.
+    cg = await indexFiles({
+      '_infra.tf': `
+module "tb_top" {
+  source = "./x"
+}
+`,
+      'tb.sv': `
+module tb_top;
+  dut_b u_dut();
+  initial force tb_top.u_dut.sig = 1'b0;
+endmodule
+`,
+      'dut_b.sv': `
+module dut_b;
+  logic sig;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'tb_top')).toEqual(['drives tb_top.u_dut.sig -> dut_b::sig']);
+  });
+
   it('labels a path that resolves only partway, and never calls it a drive', async () => {
     cg = await indexFiles({
       ...DESIGN,

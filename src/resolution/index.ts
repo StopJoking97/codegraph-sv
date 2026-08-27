@@ -1918,14 +1918,35 @@ export class ReferenceResolver {
    * (`__sv_hier__<w|r>|<a.b.c>`) by walking the design hierarchy hop by hop.
    * Returns the number of edges created.
    *
-   * Root resolution is deterministic and has NO guessing mode:
+   * Root resolution is deterministic, has NO guessing mode, and goes from the
+   * INNERMOST scope outwards — the LRM's own name-resolution order:
    *
-   *   1. the root matches a MODULE name — the elaboration top, which is the
-   *      dominant case in practice and unambiguous, module names being
-   *      effectively unique in a design;
-   *   2. otherwise the root matches an INSTANCE visible in the enclosing scope —
-   *      a relative path;
-   *   3. otherwise nothing is emitted.
+   *   1. the root names a MEMBER of the emitting scope (a signal, parameter or
+   *      struct/union variable) — then this was never a hierarchical path at
+   *      all. `bus.valid = 1'b1` on a local `bus_t bus` is a member select, and
+   *      the marker is DROPPED;
+   *   2. otherwise the root names an INSTANCE visible in the emitting scope — a
+   *      relative path;
+   *   3. otherwise the root names the emitting module ITSELF — `module tb; ...
+   *      force tb.u_dut.sig;`, the standard absolute-probe idiom. Resolving
+   *      this against the emitting module rather than by global name is what
+   *      keeps a probe inside its OWN design when several designs in one index
+   *      declare `module tb`;
+   *   4. otherwise the root matches a module by name — the elaboration top —
+   *      but ONLY when exactly one module of the SAME LANGUAGE carries that
+   *      name. Two same-named modules, or a `module` node from another language
+   *      (terraform and cobol also emit kind 'module'), emit NOTHING;
+   *   5. otherwise nothing is emitted.
+   *
+   * Rules 1-3 exist because the original order asked the GLOBAL module table
+   * first and took the first row in file-path order. That inverted LRM scoping
+   * three ways at once: a local struct-member write was fabricated into a
+   * cross-module `drives` edge whenever the variable's name collided with any
+   * module name repo-wide (`bus`, `ctrl`, `fifo`, `core`...); a probe in one
+   * testbench bound into an unrelated design that merely sorted first; and a
+   * terraform `module "tb"` could capture the root outright. Every one of those
+   * emitted a CONFIDENT edge with tree-sitter provenance, landing in the driver
+   * answer — silently wrong, which is worse than absent.
    *
    * The originally-proposed fallback to a globally-unique instance name is
    * REJECTED. It was designed around the belief that path roots are instances;
@@ -1958,6 +1979,7 @@ export class ReferenceResolver {
     >();
     const edges: Edge[] = [];
     const instancesByModule = new Map<string, Map<string, string>>();
+    const membersByScope = new Map<string, Map<string, string>>();
 
     for (const ref of candidates) {
       deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
@@ -1973,15 +1995,41 @@ export class ReferenceResolver {
       const segments = body.slice(sep + 1).split('.').filter((x) => x.length > 0);
       if (segments.length < 2) continue;
 
-      // --- root -------------------------------------------------------------
+      // --- root: innermost scope outwards, never the global table first ------
       const root = segments[0]!;
-      let current: string | undefined = this.queries
-        .getNodesByName(root)
-        .find((n) => n.kind === 'module')?.id;
+
+      // 1. A member of the emitting scope. `bus.valid` on a local `bus_t bus`
+      //    is a member select, not a hierarchical path — drop it. Binding it
+      //    would fabricate a cross-module driver out of a plain local write.
+      if (this.buildMemberMap(ref.fromNodeId, membersByScope).has(root)) continue;
+
+      // 2. An instance declared in the emitting scope — a relative path.
+      let current: string | undefined = this.buildInstanceMap(
+        ref.fromNodeId,
+        instancesByModule
+      ).get(root);
+
+      // 3. The emitting module itself — the absolute-probe idiom, resolved
+      //    WITHOUT a global name lookup so it cannot leave its own design.
       if (!current) {
-        current = this.buildInstanceMap(ref.fromNodeId, instancesByModule).get(root);
+        const from = this.queries.getNodeById(ref.fromNodeId);
+        if (from && from.kind === 'module' && from.name === root) current = from.id;
       }
-      if (!current) continue; // neither a module nor a visible instance -> nothing
+
+      // 4. The elaboration top, by name — but only when the name identifies ONE
+      //    module in this language. Ambiguity emits nothing: the feature has no
+      //    guessing mode, and picking a row order is guessing.
+      //    `ref.language` is stamped from the emitting file's detected language
+      //    at extraction time (extraction/index.ts, validRefs), so an absent
+      //    one filters to nothing — the safe direction for this pass.
+      if (!current) {
+        const named = this.queries
+          .getNodesByName(root)
+          .filter((n) => n.kind === 'module' && n.language === ref.language);
+        if (named.length === 1) current = named[0]!.id;
+      }
+
+      if (!current) continue; // no unambiguous root -> nothing
 
       // --- middle segments: instance names ----------------------------------
       let depth = 1;
