@@ -503,6 +503,12 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
     if (looksLikeObjc(source)) return 'objc';
   }
 
+  // .inc is claimed by Drupal PHP but is also the conventional Verilog include
+  // extension — disambiguate on content, defaulting to PHP (see #1 in the helper).
+  if (lang === 'php' && ext === '.inc' && source && looksLikeVerilogInclude(source)) {
+    return 'systemverilog';
+  }
+
   return lang;
 }
 
@@ -569,6 +575,32 @@ function looksLikeCpp(source: string): boolean {
 function looksLikeObjc(source: string): boolean {
   const sample = source.substring(0, 8192);
   return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
+}
+
+/**
+ * A closing keyword or compiler directive that only Verilog/SystemVerilog has.
+ * `end<construct>` is not a PHP token in any form, and a backtick directive at
+ * the start of a line is not valid PHP either — so a hit here cannot be Drupal.
+ */
+const VERILOG_INC_RE =
+  /\b(?:endmodule|endfunction|endtask|endpackage|endinterface|endgenerate|endprimitive|endclass)\b|^\s*`(?:define|ifdef|ifndef|include|timescale|undef)\b|\balways(?:_ff|_comb|_latch)?\s*@/m;
+
+/**
+ * Heuristic: is a `.inc` file Verilog rather than Drupal PHP?
+ *
+ * `.inc` is claimed by Drupal (EXTENSION_MAP -> 'php') but is also the
+ * conventional extension for a Verilog include fragment — for example a
+ * header holding a pair of `function`/`endfunction` conversion helpers,
+ * which the PHP extractor silently drops.
+ *
+ * The test is deliberately asymmetric so Drupal can never be dragged over:
+ * a `<?php` opener wins outright (every Drupal `.inc` has one, and a Verilog
+ * file cannot), and only then do we look for a construct with no PHP reading.
+ */
+function looksLikeVerilogInclude(source: string): boolean {
+  const sample = source.substring(0, 8192);
+  if (/<\?php\b|<\?=/.test(sample)) return false;
+  return VERILOG_INC_RE.test(sample);
 }
 
 /**

@@ -79,3 +79,9 @@ target-linux/
 .kommandr/kommandr.db
 .kommandr/kommandr.db-wal
 .kommandr/kommandr.db-shm
+
+# Ticket drafts awaiting publication to GitHub Issues (see docs/agents/issue-tracker.md)
+.scratch/
+
+# SystemVerilog development scratch: probe scripts, fixture corpora, build logs
+_svdev/

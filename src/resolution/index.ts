@@ -1610,6 +1610,55 @@ export class ReferenceResolver {
   }
 
   /**
+   * What counts as a bindable member of a SystemVerilog scope by default:
+   * signals and ports (`field`) plus parameters and localparams (`constant`).
+   * Subroutines are excluded — a bare identifier in an expression is a signal,
+   * and a pass that wants `function` too passes its own set.
+   */
+  private static readonly SV_BINDABLE_MEMBER_KINDS: ReadonlySet<string> = new Set([
+    'field',
+    'constant',
+  ]);
+
+  /**
+   * Name -> node-id map of a scope's bindable members, memoized per scope.
+   *
+   * Every SystemVerilog marker pass binds a bare identifier against the members
+   * of one enclosing scope, so they all need this same map. Building it costs a
+   * `contains` edge walk plus a `getNodeById` per child, which is why the caller
+   * owns the cache: a module with 300 drive markers builds its map once, not 300
+   * times.
+   *
+   * `kinds` narrows what counts as bindable — the drive pass wants signals and
+   * parameters (`field`/`constant`), a subroutine-aware pass would add
+   * `function`. `skipDecorator` drops children carrying a decorator, which is how
+   * a later macro pass keeps a module-scoped `` `define `` from shadowing a
+   * same-named signal: both land as `constant`, and the signal must win.
+   *
+   * Last write wins on a name collision, matching the previous inline behaviour.
+   */
+  private buildMemberMap(
+    scopeId: string,
+    cache: Map<string, Map<string, string>>,
+    opts?: { kinds?: ReadonlySet<string>; skipDecorator?: string }
+  ): Map<string, string> {
+    const cached = cache.get(scopeId);
+    if (cached) return cached;
+
+    const kinds = opts?.kinds ?? ReferenceResolver.SV_BINDABLE_MEMBER_KINDS;
+    const skip = opts?.skipDecorator;
+    const members = new Map<string, string>();
+    for (const e of this.queries.getOutgoingEdges(scopeId, ['contains'])) {
+      const child = this.queries.getNodeById(e.target);
+      if (!child || !kinds.has(child.kind)) continue;
+      if (skip && child.decorators?.includes(skip)) continue;
+      members.set(child.name, child.id);
+    }
+    cache.set(scopeId, members);
+    return members;
+  }
+
+  /**
    * Bind the SystemVerilog drive markers (`__sv_drive__<signal>`) the extractor
    * emits for every continuous assign, nonblocking and blocking assignment, and
    * inline net-declaration driver. Returns the number of `drives` edges created.
@@ -1653,17 +1702,7 @@ export class ReferenceResolver {
         referenceKind: ref.referenceKind,
       });
 
-      let members = membersByScope.get(ref.fromNodeId);
-      if (!members) {
-        members = new Map<string, string>();
-        for (const e of this.queries.getOutgoingEdges(ref.fromNodeId, ['contains'])) {
-          const child = this.queries.getNodeById(e.target);
-          if (child && (child.kind === 'field' || child.kind === 'constant')) {
-            members.set(child.name, child.id);
-          }
-        }
-        membersByScope.set(ref.fromNodeId, members);
-      }
+      const members = this.buildMemberMap(ref.fromNodeId, membersByScope);
 
       const target = members.get(ref.referenceName.slice(PREFIX.length));
       if (!target) continue; // implicit net or cross-module hierarchical write
