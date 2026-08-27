@@ -2722,6 +2722,58 @@ export class QueryBuilder {
     return out;
   }
 
+  /**
+   * Merge a JSON patch into the metadata of the edges at a given SITE —
+   * (source, kind, line, col). Returns the number of rows changed.
+   *
+   * Needed because an extractor can only emit unresolved REFERENCES, never edge
+   * metadata: a fact discovered at extraction time that belongs on an edge the
+   * generic resolver will create later (the SystemVerilog instance name on an
+   * `instantiates` edge) has to be merged in after resolution. The patch wins on
+   * a key collision; existing keys are preserved otherwise, so this never
+   * clobbers `confidence`/`resolvedBy`/`refName`.
+   *
+   * Matching is by site rather than by edge id because the caller holds a
+   * reference, not a row: `line`/`col` are exactly what the ref carried. An
+   * unparseable metadata blob is replaced by the patch rather than throwing —
+   * a corrupt blob is already lost, and failing here would fail the index.
+   */
+  mergeEdgeMetadata(
+    patches: readonly {
+      source: string;
+      kind: EdgeKind;
+      line: number;
+      column: number;
+      patch: Record<string, unknown>;
+    }[]
+  ): number {
+    if (patches.length === 0) return 0;
+    let changed = 0;
+    this.db.transaction(() => {
+      const select = this.db.prepare(
+        'SELECT id, metadata FROM edges WHERE source = ? AND kind = ? AND IFNULL(line, -1) = ? AND IFNULL(col, -1) = ?'
+      );
+      const update = this.db.prepare('UPDATE edges SET metadata = ? WHERE id = ?');
+      for (const p of patches) {
+        const rows = select.all(p.source, p.kind, p.line, p.column) as { id: number; metadata: string | null }[];
+        for (const row of rows) {
+          let merged: Record<string, unknown> = {};
+          if (row.metadata) {
+            try {
+              const parsed = JSON.parse(row.metadata) as unknown;
+              if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+            } catch {
+              // Corrupt blob: the patch replaces it rather than failing the index.
+            }
+          }
+          update.run(JSON.stringify({ ...merged, ...p.patch }), row.id);
+          changed++;
+        }
+      }
+    })();
+    return changed;
+  }
+
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */
   deleteEdgesByIds(edgeIds: number[]): number {
     if (edgeIds.length === 0) return 0;

@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Language, Node, UnresolvedReference, Edge } from '../types';
+import { Language, Node, UnresolvedReference, Edge, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -1722,6 +1722,68 @@ export class ReferenceResolver {
   }
 
   /**
+   * Merge SystemVerilog instance names (`__sv_inst__<label>`) onto the
+   * `instantiates` edges the generic resolver already created. Returns the
+   * number of edges annotated.
+   *
+   * A module is a DEFINITION; an instance is a named use of it. The graph binds
+   * an instantiation to the module TYPE, so a module instantiated twice used to
+   * produce two edges identical apart from their line, and nothing told one
+   * instance path from the other.
+   *
+   * An instance is not a declaration, so it correctly has no node: its name is
+   * an ATTRIBUTE of the relationship and rides in the edge's existing metadata
+   * blob. No new node kind, no new edge kind, no wire-contract change.
+   *
+   * Pairing is by SITE — (source, line, column) — which is exact because the
+   * extractor emits the instantiates ref and this marker at the same position,
+   * one pair per `hierarchical_instance`. Two instances can never share both a
+   * line and a column, so `adder u_a(), u_b();` annotates each edge with its own
+   * name. A marker whose edge never materialised (an unresolvable module type)
+   * simply patches nothing and is dropped, like every other unbindable marker.
+   */
+  resolveSvInstanceNames(): number {
+    const PREFIX = '__sv_inst__'; // mirrors SV_INST_PREFIX in the extractor
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'references' && ref.referenceName.startsWith(PREFIX));
+    if (candidates.length === 0) return 0;
+
+    const patches: {
+      source: string;
+      kind: EdgeKind;
+      line: number;
+      column: number;
+      patch: Record<string, unknown>;
+    }[] = [];
+    const deleteKeys = new Map<
+      string,
+      { fromNodeId: string; referenceName: string; referenceKind: string }
+    >();
+
+    for (const ref of candidates) {
+      deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
+        fromNodeId: ref.fromNodeId,
+        referenceName: ref.referenceName,
+        referenceKind: ref.referenceKind,
+      });
+      const instance = ref.referenceName.slice(PREFIX.length);
+      if (!instance) continue;
+      patches.push({
+        source: ref.fromNodeId,
+        kind: 'instantiates',
+        line: ref.line,
+        column: ref.column,
+        patch: { instance },
+      });
+    }
+
+    const changed = patches.length > 0 ? this.queries.mergeEdgeMetadata(patches) : 0;
+    if (deleteKeys.size > 0) this.queries.deleteSpecificResolvedReferences([...deleteKeys.values()]);
+    return changed;
+  }
+
+  /**
    * Bind the SystemVerilog factory-create and TLM-connect markers emitted by
    * the extractor (`__sv_create__<handle>__<Type>`, `__sv_connect__<from>__<to>`).
    * Both express composition/dataflow that the generic resolver can't read, so
@@ -2370,6 +2432,9 @@ export class ReferenceResolver {
       if (svHdl > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svHdl;
       const svDrv = this.resolveSvDriveEdges();
       if (svDrv > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svDrv;
+      // Instance names ride on edges the generic pass already created, so this
+      // annotates rather than resolves — it adds no edges and no stats.
+      this.resolveSvInstanceNames();
     } catch {
       // additive and optional; never fail the index on it
     }

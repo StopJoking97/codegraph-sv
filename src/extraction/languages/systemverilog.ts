@@ -538,6 +538,34 @@ function emitDriveMarkers(lvalue: SyntaxNode, site: SyntaxNode, ctx: ExtractorCo
   }
 }
 
+// -- Instances: which one is this ---------------------------------------------
+//
+// A module is a DEFINITION; an instance is a named use of it. The graph records
+// the instantiation relationship but binds it to the module TYPE, so a module
+// instantiated twice produced two edges identical apart from their line, and
+// nothing distinguished one instance path from the other.
+//
+// An instance is not a declaration, so it correctly has no node of its own: its
+// name is an ATTRIBUTE of the relationship. The instantiation edge already
+// carries a metadata blob, so the name rides there -- no new node kind, no new
+// edge kind, no wire-contract change.
+//
+// The extractor cannot write edge metadata (it only emits refs), so the name
+// travels as a marker ref positioned at the instance itself, and the SV
+// post-pass merges it into the `instantiates` edge at the same site. Pairing is
+// by (source, line, column), which is exact because the instantiates/calls refs
+// are now emitted PER hierarchical_instance at the instance's own position --
+// two instances can never share both a line and a column.
+const SV_INST_PREFIX = '__sv_inst__';
+
+/** The `u_add` label of one `hierarchical_instance` (`adder u_add (...)`). */
+function instanceLabel(hierInstance: SyntaxNode, source: string): string | undefined {
+  const nameOf = childrenOfType(hierInstance, 'name_of_instance')[0];
+  if (!nameOf) return undefined;
+  const id = childrenOfType(nameOf, 'simple_identifier')[0];
+  return id ? getNodeText(id, source).trim() : undefined;
+}
+
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
@@ -766,19 +794,42 @@ export const systemverilogExtractor: LanguageExtractor = {
       const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
       const typeName = instantiatedType(node, ctx.source); // bind to the module type, not the u_xxx label
       if (fromId && typeName) {
-        const line = node.startPosition.row + 1;
-        const column = node.startPosition.column;
-        // `instantiates` is the semantically-correct edge for the design hierarchy.
-        // We also emit `calls` so the call-graph commands (callers/callees) surface
-        // instantiation — "who instantiates this module" is the RTL analog of "who
-        // calls this function", and `impact` already walks both.
-        // Known limit: callers/callees traverse `calls` globally (every language), so
-        // we keep the `calls` edge rather than rewiring that path. If a project has
-        // BOTH a module and a subroutine of the same name, the `calls` edge can
-        // mis-bind to the subroutine; the `instantiates` edge prefers `module` via the
-        // name-matcher bias, but a same-file subroutine can still outscore it. Rare in RTL.
-        ctx.addUnresolvedReference({ fromNodeId: fromId, referenceName: typeName, referenceKind: 'instantiates', line, column });
-        ctx.addUnresolvedReference({ fromNodeId: fromId, referenceName: typeName, referenceKind: 'calls', line, column });
+        // One statement can declare SEVERAL instances (`adder u_a(), u_b();`),
+        // so the edges are emitted per hierarchical_instance, each positioned at
+        // its own label. A malformed statement with no hierarchical_instance
+        // still emits one edge at the statement, so the design hierarchy never
+        // regresses to nothing.
+        const instances = childrenOfType(node, 'hierarchical_instance');
+        const sites: { site: SyntaxNode; label?: string }[] = instances.length > 0
+          ? instances.map((inst) => ({ site: inst, label: instanceLabel(inst, ctx.source) }))
+          : [{ site: node, label: undefined }];
+        for (const { site, label } of sites) {
+          const line = site.startPosition.row + 1;
+          const column = site.startPosition.column;
+          // `instantiates` is the semantically-correct edge for the design hierarchy.
+          // We also emit `calls` so the call-graph commands (callers/callees) surface
+          // instantiation — "who instantiates this module" is the RTL analog of "who
+          // calls this function", and `impact` already walks both.
+          // Known limit: callers/callees traverse `calls` globally (every language), so
+          // we keep the `calls` edge rather than rewiring that path. If a project has
+          // BOTH a module and a subroutine of the same name, the `calls` edge can
+          // mis-bind to the subroutine; the `instantiates` edge prefers `module` via the
+          // name-matcher bias, but a same-file subroutine can still outscore it. Rare in RTL.
+          ctx.addUnresolvedReference({ fromNodeId: fromId, referenceName: typeName, referenceKind: 'instantiates', line, column });
+          ctx.addUnresolvedReference({ fromNodeId: fromId, referenceName: typeName, referenceKind: 'calls', line, column });
+          // The instance LABEL rides as a marker the SV post-pass merges into
+          // the instantiates edge's metadata blob. `references` is the carrier
+          // kind only — the marker never becomes an edge of its own.
+          if (label) {
+            ctx.addUnresolvedReference({
+              fromNodeId: fromId,
+              referenceName: `${SV_INST_PREFIX}${label}`,
+              referenceKind: 'references',
+              line,
+              column,
+            });
+          }
+        }
       }
       return false; // keep walking: port-connection expressions may contain calls
     }

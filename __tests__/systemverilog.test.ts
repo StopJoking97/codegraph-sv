@@ -1056,6 +1056,117 @@ endmodule
   });
 });
 
+describe('SystemVerilog instance names on instantiation edges', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-inst-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  /** `<instance>@L<line>` for every instantiates edge out of the named module. */
+  function instancesIn(graph: CodeGraph, parent: string): string[] {
+    const node = graph.getNodesByKind('module').find((n) => n.name === parent);
+    expect(node, `module ${parent}`).toBeDefined();
+    return graph
+      .getOutgoingEdges(node!.id)
+      .filter((e) => e.kind === 'instantiates')
+      .map((e) => `${(e.metadata as { instance?: string } | undefined)?.instance ?? '<none>'}@L${e.line}`)
+      .sort();
+  }
+
+  it('records the instance label on every instantiation edge', async () => {
+    cg = await indexFiles({
+      'design.v': `
+module leaf(input a, output y);
+  assign y = ~a;
+endmodule
+module top(input x, output z);
+  leaf u_leaf(.a(x), .y(z));
+endmodule
+`,
+    });
+    expect(instancesIn(cg, 'top')).toEqual(['u_leaf@L6']);
+  });
+
+  it('distinguishes two instantiations of the same module in one parent', async () => {
+    // A parent that instantiates the same module twice: without a name the
+    // two edges differ only by line number.
+    cg = await indexFiles({
+      'dual.v': `
+module leaf(input a, output y);
+  assign y = ~a;
+endmodule
+module top(input x, output z1, output z2);
+  leaf u_main(.a(x), .y(z1));
+  leaf u_sub (.a(x), .y(z2));
+endmodule
+`,
+    });
+    expect(instancesIn(cg, 'top')).toEqual(['u_main@L6', 'u_sub@L7']);
+  });
+
+  it('gives each instance of a multi-instance statement its own name', async () => {
+    // `leaf u_a(...), u_b(...);` is one statement and two instances. Emitting
+    // per-statement would collapse them into a single edge.
+    cg = await indexFiles({
+      'multi.v': `
+module leaf(input a, output y);
+  assign y = ~a;
+endmodule
+module top(input x, output z1, output z2);
+  leaf u_a(.a(x), .y(z1)), u_b(.a(x), .y(z2));
+endmodule
+`,
+    });
+    expect(instancesIn(cg, 'top')).toEqual(['u_a@L6', 'u_b@L6']);
+  });
+
+  it('leaves no instance marker unresolved after indexing', async () => {
+    cg = await indexFiles({
+      'design.v': `
+module leaf(input a, output y);
+  assign y = ~a;
+endmodule
+module top(input x, output z);
+  leaf u_leaf(.a(x), .y(z));
+  missing_leaf u_ghost(.a(x));
+endmodule
+`,
+    });
+    // Opens its own connection (the CodeGraph handle can't read the residual
+    // ref table) and closes it so teardown's destroy() doesn't trip a Windows
+    // file lock — same pattern as lingeringHandleRefs above.
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_inst__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    // Both markers are consumed: the bound one patches its edge, and the one
+    // whose module type never resolved patches nothing and is still dropped.
+    expect(left).toEqual([]);
+  });
+});
+
 describe('SystemVerilog driver edges — module-scoped binding', () => {
   let tempDir: string;
   let cg: CodeGraph | undefined;
