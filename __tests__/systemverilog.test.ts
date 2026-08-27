@@ -1288,6 +1288,37 @@ endmodule
     );
   });
 
+  it('keeps the output-direction connection when the CHILD is the file that changed', async () => {
+    // The other direction, and the more ordinary edit: touching a leaf module.
+    // Nothing re-extracts the parent, so its `__sv_conn__` markers stay consumed
+    // and the connect pass has nothing to rebuild from — meanwhile the FK
+    // cascade has already taken the output edge along with the port node it was
+    // sourced at. Input and inout connections are rescued by the incoming-edge
+    // reattachment, so the graph came back looking complete while every
+    // "what does this module drive upward" answer had quietly lost an arm.
+    cg = await indexFiles({
+      'child.v': CHILD,
+      'top.v': `
+module top;
+  wire sys_clk, out1, sda_bus;
+  wire [3:0] data;
+  child u_a (.clk(sys_clk), .d(data), .y(out1), .sda(sda_bus));
+endmodule
+`,
+    });
+    const before = connectionsOf(cg!);
+    expect(before).toContain('child::y -> top::out1 [u_a.y output] @L5');
+    expect(before.length).toBe(4);
+
+    // A comment-only edit of the CHILD. Every port keeps its name, so every
+    // connection is still true; only the child's node ids move.
+    fs.writeFileSync(path.join(tempDir, 'child.v'), `// touched${CHILD}`);
+    await cg!.sync();
+
+    // The instantiation site never moved, so the line stamps are unchanged.
+    expect(connectionsOf(cg!)).toEqual(before);
+  });
+
   it('resolves positional connections, and a skipped one does not shift the rest', async () => {
     // `child u (sys_clk, , out1, sda_bus)` leaves port 1 (`d`) unconnected.
     // The grammar emits NO node for the empty slot, so counting connections by

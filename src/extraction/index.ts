@@ -2428,6 +2428,16 @@ export class ExtractionOrchestrator {
       ? this.queries.getCrossFileIncomingEdgesWithTarget(filePath)
       : [];
 
+    // The one OUTGOING edge that also needs rescuing. Everything else pointing
+    // out of this file is rebuilt by re-extracting the reference that made it —
+    // that reference lives here. An output-direction port connection does not:
+    // it is sourced at THIS file's port and marked at the instantiating
+    // parent's, so re-indexing a child module cascades the edge away while the
+    // only marker that could rebuild it sits in a file this sync never touched.
+    const crossFileOutgoingConnects = existingFile
+      ? this.queries.getCrossFileOutgoingConnectsWithSource(filePath)
+      : [];
+
     // Delete existing data for this file
     if (existingFile) {
       this.queries.deleteFile(filePath);
@@ -2479,6 +2489,9 @@ export class ExtractionOrchestrator {
       if (crossFileIncomingEdges.length > 0) {
         this.reattachCrossFileEdges(crossFileIncomingEdges, validNodes);
       }
+      if (crossFileOutgoingConnects.length > 0) {
+        this.reattachCrossFileOutgoingConnects(crossFileOutgoingConnects, validNodes);
+      }
       return;
     }
 
@@ -2516,6 +2529,9 @@ export class ExtractionOrchestrator {
     // context and risk a rebind a full re-index would never make.
     if (crossFileIncomingEdges.length > 0) {
       this.reattachCrossFileEdges(crossFileIncomingEdges, validNodes);
+    }
+    if (crossFileOutgoingConnects.length > 0) {
+      this.reattachCrossFileOutgoingConnects(crossFileOutgoingConnects, validNodes);
     }
 
     // Insert unresolved references in batch with denormalized filePath/language
@@ -2628,6 +2644,59 @@ export class ExtractionOrchestrator {
     }
     if (resurrected.length > 0) {
       this.queries.insertUnresolvedRefsBatch(resurrected);
+    }
+  }
+
+  /**
+   * The outgoing counterpart of {@link reattachCrossFileEdges}, for the one
+   * edge kind a re-index cannot rebuild from the file it just re-extracted.
+   *
+   * An OUTPUT-direction port connection runs from the CHILD module's port to
+   * the parent's net, but the `__sv_conn__` marker that builds it is written at
+   * the PARENT's instantiation site. Re-index the parent and everything works:
+   * the incoming half is deliberately skipped above and the connect pass
+   * rebuilds it from the parent's fresh markers. Re-index the CHILD and it does
+   * not: the FK cascade takes the edge along with the port node it was sourced
+   * at, the parent was never revisited so its marker is long consumed, and the
+   * connection is simply gone — silently, and until someone runs a full index.
+   * Editing a leaf module is the most ordinary thing an RTL author does, so the
+   * every-day edit was the one that left the graph a half-answer.
+   *
+   * Input and inout connections are NOT rescued here on purpose: they run from
+   * the parent's net INTO the child's port, so an outgoing one means this file
+   * is the parent — the marker is in the file just re-extracted, the connect
+   * pass rebuilds it, and re-attaching would leave two edges for one
+   * connection. Exactly mirrors the direction test in `reattachCrossFileEdges`.
+   */
+  private reattachCrossFileOutgoingConnects(
+    crossFileOutgoingConnects: Array<Edge & { sourceName: string; sourceKind: string }>,
+    validNodes: Node[]
+  ): void {
+    const newNodesByKindName = new Map<string, string>();
+    for (const n of validNodes) {
+      newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+    }
+    const reinserted: Edge[] = [];
+    for (const e of crossFileOutgoingConnects) {
+      if ((e.metadata as { portDirection?: string } | undefined)?.portDirection !== 'output') {
+        continue;
+      }
+      // The TARGET (the parent's net) was never touched, so its id still
+      // stands; only the source port was re-created under a new id.
+      const newSourceId = newNodesByKindName.get(`${e.sourceKind}\0${e.sourceName}`);
+      if (!newSourceId) continue; // port renamed or removed — staying dropped is correct
+      reinserted.push({
+        source: newSourceId,
+        target: e.target,
+        kind: e.kind,
+        metadata: e.metadata,
+        line: e.line,
+        column: e.column,
+        provenance: e.provenance,
+      });
+    }
+    if (reinserted.length > 0) {
+      this.queries.insertEdges(reinserted);
     }
   }
 

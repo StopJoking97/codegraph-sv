@@ -905,7 +905,22 @@ export class CodeGraph {
             //
             // Gated on an SV file actually having changed so no other language's
             // repo pays for eight full-table marker scans on every sync.
-            if (result.changedFilePaths.some((p) => detectLanguage(p) === 'systemverilog')) {
+            //
+            // The gate asks the INDEX what the file is, not the path. Extension
+            // alone is not the answer for this language: `.inc` is shared with
+            // several others and is settled by sniffing the content at
+            // extraction time, and a project can map any extension it likes via
+            // `codegraph.json`. A path-only `detectLanguage(p)` sees neither, so
+            // a Verilog `.inc` — or any overridden extension — was extracted as
+            // SystemVerilog, wrote its markers, and then skipped every pass that
+            // binds them. The stored record already carries the verdict those
+            // two mechanisms reached. `detectLanguage` remains the fallback for
+            // a DELETED file, which no longer has a record to ask.
+            const svChanged = result.changedFilePaths.some(
+              (p) =>
+                (this.queries.getFileByPath(p)?.language ?? detectLanguage(p)) === 'systemverilog'
+            );
+            if (svChanged) {
               const tSv = Date.now();
               const svEdges = this.resolver.runSvPostPasses();
               if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-sv-post-passes: ${Date.now() - tSv}ms (${svEdges} edges)`);

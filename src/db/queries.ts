@@ -1961,6 +1961,40 @@ export class QueryBuilder {
     }));
   }
 
+  /**
+   * The mirror of {@link getCrossFileIncomingEdgesWithTarget}, scoped to
+   * SystemVerilog port connections: cross-file `connects` edges whose SOURCE is
+   * a node in `filePath`, paired with that source node's (name, kind) so the
+   * caller can re-resolve it to the re-indexed node's new ID.
+   *
+   * Outgoing edges normally need no rescue — a re-index re-extracts the very
+   * reference that built them. An OUTPUT-direction port connection is the one
+   * exception in the graph: it is SOURCED at the child module's port but
+   * MARKED at the parent's instantiation site. Re-index the child and the FK
+   * cascade takes the edge with its port node, while the marker that would
+   * rebuild it sits in a parent file nothing revisited — so the connection is
+   * gone until a full re-index. See `reattachCrossFileOutgoingConnects`.
+   */
+  getCrossFileOutgoingConnectsWithSource(
+    filePath: string
+  ): Array<Edge & { sourceName: string; sourceKind: NodeKind }> {
+    const sql = `SELECT e.*, src.name AS source_name, src.kind AS source_kind
+      FROM edges e
+      JOIN nodes src ON src.id = e.source
+      JOIN nodes tgt ON tgt.id = e.target
+      WHERE src.file_path = ?
+        AND e.kind = 'connects'
+        AND tgt.file_path != ?`;
+    const rows = this.db.prepare(sql).all(filePath, filePath) as Array<
+      EdgeRow & { source_name: string; source_kind: NodeKind }
+    >;
+    return rows.map(row => ({
+      ...rowToEdge(row),
+      sourceName: row.source_name,
+      sourceKind: row.source_kind,
+    }));
+  }
+
   // ===========================================================================
   // File Operations
   // ===========================================================================
