@@ -82,6 +82,46 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Settings for `codegraph verify`, the pass that grades the index against an
+   * independent compiler front-end (see src/verify/). Absent (the default)
+   * degrades the pass to SYNTAX-ONLY grading with no include path and no
+   * defines — still useful, and the pass says which mode it used.
+   *
+   *   {
+   *     "verify": {
+   *       "includeDirs": ["rtl/include", "macro"],
+   *       "defines": { "SYNTHESIS": "1", "FPGA": "" },
+   *       "include": ["rtl/**"],
+   *       "exclude": ["ip/fpga/lib/**"]
+   *     }
+   *   }
+   *
+   * `include`/`exclude` narrow the GRADED population inside what the index
+   * already contains; they never widen it. Scoping to the index is mandatory
+   * and is not configurable — grading a tool on files it was never asked to
+   * index produces a meaningless number.
+   */
+  verify?: {
+    /** Directories searched for `` `include `` files, project-root-relative. */
+    includeDirs?: string[];
+    /** Preprocessor defines: name → value (an empty string means "defined"). */
+    defines?: Record<string, string>;
+    /** Gitignore-style patterns narrowing the graded set to these paths. */
+    include?: string[];
+    /** Gitignore-style patterns dropping paths from the graded set. */
+    exclude?: string[];
+  };
+}
+
+/** Validated view of the `verify` block. Every field defaults to empty. */
+export interface VerifyConfig {
+  includeDirs: string[];
+  defines: Record<string, string>;
+  include: string[];
+  exclude: string[];
+  /** False when no `verify` block was present — the pass reports the mode. */
+  configured: boolean;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +131,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  verify: VerifyConfig;
 }
 
 interface CacheEntry {
@@ -108,12 +149,21 @@ const cache = new Map<string, CacheEntry>();
 
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
+const EMPTY_VERIFY: VerifyConfig = Object.freeze({
+  includeDirs: Object.freeze([]) as unknown as string[],
+  defines: Object.freeze({}) as Record<string, string>,
+  include: Object.freeze([]) as unknown as string[],
+  exclude: Object.freeze([]) as unknown as string[],
+  configured: false,
+});
+
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  verify: EMPTY_VERIFY,
 });
 
 /**
@@ -167,16 +217,18 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const verify = extractVerify(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    verify === EMPTY_VERIFY
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, verify };
 }
 
 /**
@@ -389,6 +441,65 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/**
+ * Load the validated `verify` block for a project, mtime-cached.
+ *
+ * `configured` is false when the block is absent OR carried nothing usable, so
+ * the verify pass can say which mode it ran in rather than silently grading
+ * without an include path and reporting the result as if it were complete.
+ */
+export function loadVerifyConfig(rootDir: string): VerifyConfig {
+  return loadParsedConfig(rootDir).verify;
+}
+
+/**
+ * Validate the `verify` block. Every failure mode degrades to "not configured"
+ * — a malformed block must leave the pass in syntax-only mode, not throw.
+ */
+function extractVerify(parsed: object, file: string): VerifyConfig {
+  const raw = (parsed as ProjectConfig).verify;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return EMPTY_VERIFY;
+
+  const strings = (val: unknown, field: string): string[] => {
+    if (val === undefined) return [];
+    if (!Array.isArray(val)) {
+      logWarn(`Ignoring verify.${field} in ${PROJECT_CONFIG_FILENAME}: expected an array of strings`, { file });
+      return [];
+    }
+    return val.filter((v): v is string => typeof v === 'string' && v.trim().length > 0).map((v) => v.trim());
+  };
+
+  const defines: Record<string, string> = {};
+  if (raw.defines !== undefined) {
+    if (!raw.defines || typeof raw.defines !== 'object' || Array.isArray(raw.defines)) {
+      logWarn(`Ignoring verify.defines in ${PROJECT_CONFIG_FILENAME}: expected an object of name → value`, { file });
+    } else {
+      for (const [k, v] of Object.entries(raw.defines)) {
+        // A macro name is an identifier; anything else could not be passed to a
+        // preprocessor safely and is dropped rather than shell-quoted blindly.
+        if (!/^[A-Za-z_]\w*$/.test(k)) {
+          logWarn(`Ignoring verify define "${k}" in ${PROJECT_CONFIG_FILENAME}: not a valid macro name`, { file });
+          continue;
+        }
+        defines[k] = typeof v === 'string' ? v : String(v ?? '');
+      }
+    }
+  }
+
+  const includeDirs = strings(raw.includeDirs, 'includeDirs');
+  const include = strings(raw.include, 'include');
+  const exclude = strings(raw.exclude, 'exclude');
+  if (
+    includeDirs.length === 0 &&
+    include.length === 0 &&
+    exclude.length === 0 &&
+    Object.keys(defines).length === 0
+  ) {
+    return EMPTY_VERIFY;
+  }
+  return { includeDirs, defines, include, exclude, configured: true };
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

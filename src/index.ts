@@ -27,6 +27,7 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
+import { verifyIndex, type VerifyOptions, type VerifyOutcome } from './verify';
 import {
   isInitialized,
   createDirectory,
@@ -1282,6 +1283,18 @@ export class CodeGraph {
   // ===========================================================================
   // Graph Statistics
   // ===========================================================================
+
+  /**
+   * Grade this index against an independent compiler front-end and report where
+   * they disagree (`codegraph verify`).
+   *
+   * Never throws: an absent, failing or timed-out grader all come back as a
+   * `skipped` outcome carrying the reason. A verification pass that can block a
+   * teammate is worse than no verification pass.
+   */
+  verify(options: VerifyOptions = {}): VerifyOutcome {
+    return verifyIndex(this.projectRoot, this.queries, options);
+  }
 
   /**
    * Get statistics about the knowledge graph

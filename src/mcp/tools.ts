@@ -1222,6 +1222,29 @@ export const tools: ToolDefinition[] = [
     annotations: READ_ONLY_ANNOTATIONS,
   },
   {
+    name: 'codegraph_verify',
+    description:
+      'Grade the SystemVerilog index against an independent compiler front-end and report where they ' +
+      'disagree (MISSING / BRANCH-UNION / UNEXPLAINED), plus indexed files that no longer exist on disk. ' +
+      'Use to check whether the index can be trusted, not to find symbols.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strict: {
+          type: 'boolean',
+          description: 'Report a failure verdict when any declaration is MISSING (default: false)',
+          default: false,
+        },
+        timeoutMs: {
+          type: 'number',
+          description: 'Grader budget in milliseconds (default: 120000)',
+        },
+        projectPath: projectPathProperty,
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_files',
     description: 'Indexed file tree with language + symbol counts. Faster than Glob for project layout.',
     inputSchema: {
@@ -2157,6 +2180,7 @@ export class ToolHandler {
       case 'codegraph_explore': return await this.handleExplore(args);
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
+      case 'codegraph_verify': return await this.handleVerify(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
   }
@@ -6416,6 +6440,24 @@ export class ToolHandler {
       lines.push(`**Probed by ←** ${probes.slice(0, TRAIL_CAP).map(fmt).join(', ')}${probes.length > TRAIL_CAP ? `, +${probes.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
+  }
+
+  /**
+   * Handle codegraph_verify — grade the index against an independent compiler
+   * front-end.
+   *
+   * Always a SUCCESS-shaped result, including when the grader is absent, failed
+   * or timed out: a verification pass that reports `isError` teaches an agent to
+   * stop calling codegraph entirely, and "the grader is not installed" is an
+   * expected condition, not a malfunction.
+   */
+  private async handleVerify(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const { formatVerifyReport } = await import('../verify');
+    const strict = args.strict === true;
+    const timeoutMs = typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined;
+    const outcome = cg.verify({ strict, timeoutMs });
+    return this.textResult(formatVerifyReport(outcome, strict));
   }
 
   /**

@@ -1893,6 +1893,7 @@ program
         console.error(chalk.cyan('  codegraph_node') + '      - Get symbol details');
         console.error(chalk.cyan('  codegraph_files') + '     - Get project file structure');
         console.error(chalk.cyan('  codegraph_status') + '    - Get index status');
+        console.error(chalk.cyan('  codegraph_verify') + '    - Grade the SystemVerilog index against a compiler front-end');
       }
     } catch (err) {
       error(`Failed to start server: ${err instanceof Error ? err.message : String(err)}`);
@@ -1927,6 +1928,60 @@ program
       else info(`No stale lock files found ${getGlyphs().dash} nothing to do`);
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph verify [path]
+ *
+ * Grade the index against an independent compiler front-end. A STANDALONE
+ * subcommand rather than a flag on indexing: grading must be runnable without
+ * re-indexing, which is the whole point of it being a standing property.
+ *
+ * Its exit code is 0 for everything except `--strict` with a real MISSING.
+ * Absence of the grader, a grader failure and a grader timeout all print a skip
+ * and exit 0 — a verification pass that can block a teammate is worse than no
+ * verification pass.
+ */
+program
+  .command('verify [path]')
+  .description('Grade the index against an independent compiler front-end (SystemVerilog)')
+  .option('-s, --strict', 'Exit non-zero when any declaration is MISSING (for CI)')
+  .option('-j, --json', 'Output as JSON')
+  .option('-t, --timeout <ms>', 'Grader budget in milliseconds')
+  .action(async (
+    pathArg: string | undefined,
+    options: { strict?: boolean; json?: boolean; timeout?: string }
+  ) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const { formatVerifyReport, verifyExitCode } = await import('../verify');
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        const timeoutMs = options.timeout ? Number(options.timeout) : undefined;
+        const outcome = cg.verify({
+          strict: options.strict,
+          timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined,
+        });
+
+        if (options.json) console.log(JSON.stringify(outcome, null, 2));
+        else console.log('\n' + formatVerifyReport(outcome, options.strict) + '\n');
+
+        const code = verifyExitCode(outcome, options.strict);
+        if (code !== 0) process.exit(code);
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`Failed to verify: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
