@@ -744,6 +744,47 @@ function emitConnectMarkers(hierInstance: SyntaxNode, ctx: ExtractorContext): vo
   }
 }
 
+// -- Readers: who reads this net ----------------------------------------------
+//
+// `drives` answered the write side and nothing answered the read side, so every
+// fanout question was half-answered -- which is worse than unanswered, because
+// it invites false confidence.
+//
+// Read position is decided by the identifier's PARENT construct, not by "any
+// identifier inside an expression". A census over an RTL corpus
+// found only these parents of a `hierarchical_identifier`:
+//
+//   primary                    READ      an operand of some expression
+//   variable_lvalue            write     an assignment target
+//   nonrange_variable_lvalue   write     an assignment target
+//   defparam_assignment        neither   a parameter override, always dotted
+//   tf_call                    neither   a subroutine NAME, not a signal
+//   event_trigger              neither   `->ev;` triggers, it does not read
+//   disable_statement          neither   a block LABEL, not a signal
+//
+// So `primary` is the whole rule, and it is the rule that matters: getting it
+// wrong makes an assignment's left-hand side a read of itself, so "what reads X"
+// returns X's writer -- the exact bug this feature exists to prevent.
+//
+// Anchoring on `primary` also gets the subtle cases for free, because the
+// grammar nests an index expression under its own primary even when the whole
+// construct is an lvalue: in `mem[sel] <= q`, `mem`'s parent is variable_lvalue
+// (a write) while `sel`'s parent is primary (a read of the index signal).
+// Sensitivity lists, conditions, concatenations, ternaries and subroutine
+// arguments are all ordinary expressions and need no special case.
+//
+// A MULTI-segment identifier (`dut.core.sig`) is skipped: module-scoped binding
+// cannot reach another module, and guessing by last segment would invent edges.
+const SV_READ_PREFIX = '__sv_read__';
+
+/**
+ * True when this `hierarchical_identifier` sits in READ position: its parent is
+ * a `primary` and it names exactly one segment.
+ */
+function isReadPosition(hierId: SyntaxNode): boolean {
+  return hierId.parent?.type === 'primary';
+}
+
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
@@ -899,6 +940,30 @@ export const systemverilogExtractor: LanguageExtractor = {
    */
   visitNode: (node: SyntaxNode, ctx: ExtractorContext): boolean => {
     const t = node.type;
+
+    // Reads. This is the FIRST branch of the ladder and the only one that ever
+    // fires on a `hierarchical_identifier`, so a later feature that wants to
+    // treat a dotted identifier differently folds into THIS branch rather than
+    // adding a second one below it — a first-match-wins ladder would make the
+    // second branch unreachable dead code.
+    if (t === 'hierarchical_identifier') {
+      const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
+      if (!fromId) return false;
+      const ids = childrenOfType(node, 'simple_identifier');
+      if (ids.length === 1 && ids[0] && isReadPosition(node)) {
+        const name = getNodeText(ids[0], ctx.source).trim();
+        if (name) {
+          ctx.addUnresolvedReference({
+            fromNodeId: fromId,
+            referenceName: `${SV_READ_PREFIX}${name}`,
+            referenceKind: 'reads',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+      }
+      return false; // keep walking: a select's index is its own subtree
+    }
 
     // Enum typedefs: the engine's type-alias path can't emit enum members (it
     // looks for enumTypes, which SV leaves empty), so build the enum + members here.

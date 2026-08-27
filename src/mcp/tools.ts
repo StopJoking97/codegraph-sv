@@ -392,7 +392,7 @@ const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
  * is declared in a different file from the net it is wired to — in both cases
  * the node's startLine points at something the reader did not ask about.
  */
-const HDL_SITE_EDGE_KINDS: ReadonlySet<string> = new Set(['drives', 'connects']);
+const HDL_SITE_EDGE_KINDS: ReadonlySet<string> = new Set(['drives', 'connects', 'reads']);
 
 /**
  * Cap on what PERIPHERAL nodes (in the subgraph, but neither a query match nor
@@ -6382,13 +6382,26 @@ export class ToolHandler {
     };
     const callees = collect(cg.getCallees(node.id));
     const callers = collect(cg.getCallers(node.id));
-    if (callees.length === 0 && callers.length === 0) return '';
+    // Readers come STRAIGHT from the edge table, not through the caller
+    // traversal. A read and a drive on the same net share a source (the module
+    // that does both), and the traversal's visited-set keeps only the first edge
+    // it sees per node — folding `reads` in there would silently replace the
+    // driver answer with a reader roughly half the time.
+    const readers = cg
+      .getIncomingEdges(node.id)
+      .filter((e) => e.kind === 'reads')
+      .map((e) => ({ node: cg.getNode(e.source), edge: e }))
+      .filter((r): r is { node: Node; edge: Edge } => r.node !== null && r.node !== undefined);
+    if (callees.length === 0 && callers.length === 0 && readers.length === 0) return '';
     const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
       lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
     }
     if (callers.length > 0) {
       lines.push(`**Called by ←** ${callers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callers.length > TRAIL_CAP ? `, +${callers.length - TRAIL_CAP} more` : ''}`);
+    }
+    if (readers.length > 0) {
+      lines.push(`**Read by ←** ${readers.slice(0, TRAIL_CAP).map(fmt).join(', ')}${readers.length > TRAIL_CAP ? `, +${readers.length - TRAIL_CAP} more` : ''}`);
     }
     return lines.join('\n');
   }
@@ -6985,6 +6998,15 @@ export class ToolHandler {
       const what = m.instance && m.port ? `${m.instance}.${m.port}` : (m.port ?? 'port');
       const dir = m.portDirection ? ` ${m.portDirection}` : '';
       return edge.line ? `connects ${what}${dir} at line ${edge.line}` : `connects ${what}${dir}`;
+    }
+    // A `reads` edge is AGGREGATED per (reader, net): one edge, many sites. The
+    // whole line list is the answer — printing only the anchor line would send
+    // the reader to one of N places with no hint that the others exist.
+    if (edge.kind === 'reads') {
+      const lines = (edge.metadata as { lines?: number[] } | undefined)?.lines;
+      if (!lines || lines.length === 0) return 'reads';
+      const shown = lines.slice(0, 6).join(', ');
+      return `reads at line${lines.length > 1 ? 's' : ''} ${shown}${lines.length > 6 ? `, +${lines.length - 6} more` : ''}`;
     }
     return edge.kind;
   }

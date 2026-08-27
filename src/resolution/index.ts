@@ -1783,6 +1783,96 @@ export class ReferenceResolver {
     return changed;
   }
 
+  /**
+   * Bind the SystemVerilog read markers (`__sv_read__<signal>`) into `reads`
+   * edges. Returns the number of edges created.
+   *
+   * The mirror of the drive pass, with one structural difference: edges are
+   * AGGREGATED per (reader, net) pair, with every read line carried in the
+   * edge's metadata. Per-site edges were rejected because binding is
+   * scope-local — every site in a module shares one source and one target — and
+   * the traversal layer already collapses duplicates by node, so per-site rows
+   * would multiply storage without adding a single answerable question.
+   *
+   * Two constraints that are not optional:
+   *
+   *   - Existing edges of this kind are DELETED for the affected sources before
+   *     inserting. INSERT OR IGNORE against the identity index would silently
+   *     keep a stale line list when a read is added below an existing one.
+   *   - `reads` must NOT join the incoming-edge set used by the generic caller
+   *     traversal. Binding is scope-local, so a read and a drive on the same net
+   *     share a source, and the traversal's visited-set would discard one of
+   *     them — corrupting the existing driver answer. Readers are surfaced
+   *     directly from the edge table instead (see formatTrail).
+   *
+   * Binding is module-scoped for the same reason drives is: RTL reuses signal
+   * names across the whole design, and a read bound to another module's
+   * same-named net is worse than no edge at all. A marker that matches nothing
+   * is dropped — an implicit net, a package constant, or a class member outside
+   * the emitting scope.
+   */
+  resolveSvReadEdges(): number {
+    const PREFIX = '__sv_read__'; // mirrors SV_READ_PREFIX in the extractor
+    const candidates = this.queries
+      .getUnresolvedReferences()
+      .filter((ref) => ref.referenceKind === 'reads' && ref.referenceName.startsWith(PREFIX));
+    if (candidates.length === 0) return 0;
+
+    const membersByScope = new Map<string, Map<string, string>>();
+    const deleteKeys = new Map<
+      string,
+      { fromNodeId: string; referenceName: string; referenceKind: string }
+    >();
+    // (source, target) -> the lines it was read on, in encounter order.
+    const grouped = new Map<string, { source: string; target: string; lines: number[]; column: number }>();
+
+    for (const ref of candidates) {
+      deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
+        fromNodeId: ref.fromNodeId,
+        referenceName: ref.referenceName,
+        referenceKind: ref.referenceKind,
+      });
+
+      const members = this.buildMemberMap(ref.fromNodeId, membersByScope);
+      const target = members.get(ref.referenceName.slice(PREFIX.length));
+      if (!target) continue; // implicit net or out-of-scope name
+
+      const key = `${ref.fromNodeId}|${target}`;
+      const entry = grouped.get(key);
+      if (entry) {
+        if (!entry.lines.includes(ref.line)) entry.lines.push(ref.line);
+      } else {
+        grouped.set(key, { source: ref.fromNodeId, target, lines: [ref.line], column: ref.column });
+      }
+    }
+
+    // Idempotence: wipe this kind for every scope that re-emitted markers, so a
+    // re-index replaces the line list rather than keeping a stale one.
+    const affected = [...new Set([...deleteKeys.values()].map((k) => k.fromNodeId))];
+    this.queries.deleteEdgesBySourcesAndKind(affected, 'reads');
+
+    const edges: Edge[] = [];
+    for (const g of grouped.values()) {
+      const lines = g.lines.slice().sort((a, b) => a - b);
+      edges.push({
+        source: g.source,
+        target: g.target,
+        kind: 'reads',
+        // The FIRST read site anchors the edge; the whole list rides in
+        // metadata, because "where is it read" has more than one answer and a
+        // single line would silently pick one.
+        line: lines[0],
+        column: g.column,
+        provenance: 'tree-sitter',
+        metadata: { lines, readCount: lines.length },
+      });
+    }
+
+    if (edges.length > 0) this.queries.insertEdges(edges);
+    if (deleteKeys.size > 0) this.queries.deleteSpecificResolvedReferences([...deleteKeys.values()]);
+    return edges.length;
+  }
+
   /** Port directions, which are also the decorators an extracted SV port carries. */
   private static readonly SV_PORT_DIRECTIONS: ReadonlySet<string> = new Set([
     'input',
@@ -2632,6 +2722,8 @@ export class ReferenceResolver {
       this.resolveSvInstanceNames();
       const svConn = this.resolveSvConnectEdges();
       if (svConn > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svConn;
+      const svRead = this.resolveSvReadEdges();
+      if (svRead > 0) aggregateStats.byMethod['qualified-name'] = (aggregateStats.byMethod['qualified-name'] || 0) + svRead;
     } catch {
       // additive and optional; never fail the index on it
     }

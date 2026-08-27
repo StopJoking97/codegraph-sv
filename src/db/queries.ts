@@ -2774,6 +2774,31 @@ export class QueryBuilder {
     return changed;
   }
 
+  /**
+   * Delete every edge of one kind whose source is in `sourceIds`. Returns the
+   * number of rows removed.
+   *
+   * The aggregating HDL passes need this: a `reads` edge carries the LIST of
+   * read lines in its metadata, so re-inserting with INSERT OR IGNORE against
+   * the identity index would keep the stale list forever — a read added below an
+   * existing one would never appear. Deleting the affected sources' rows first
+   * makes the pass idempotent by construction.
+   */
+  deleteEdgesBySourcesAndKind(sourceIds: readonly string[], kind: EdgeKind): number {
+    if (sourceIds.length === 0) return 0;
+    let changed = 0;
+    this.db.transaction(() => {
+      for (let i = 0; i < sourceIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = sourceIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        changed += this.db
+          .prepare(`DELETE FROM edges WHERE kind = ? AND source IN (${placeholders})`)
+          .run(kind, ...chunk).changes;
+      }
+    })();
+    return changed;
+  }
+
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */
   deleteEdgesByIds(edgeIds: number[]): number {
     if (edgeIds.length === 0) return 0;

@@ -1416,6 +1416,235 @@ endmodule
   });
 });
 
+describe('SystemVerilog read edges (what reads this net)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-reads-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  function signal(graph: CodeGraph, name: string, file: string): Node {
+    const node = graph
+      .getNodesByKind('field')
+      .find((n) => n.name === name && n.filePath === file);
+    expect(node, `signal ${name} in ${file}`).toBeDefined();
+    return node!;
+  }
+
+  /** `<reader>@[lines]` for every reads edge into the named signal. */
+  function readersOf(graph: CodeGraph, name: string, file: string): string[] {
+    return graph
+      .getIncomingEdges(signal(graph, name, file).id)
+      .filter((e) => e.kind === 'reads')
+      .map((e) => {
+        const reader = graph.getNode(e.source);
+        const lines = (e.metadata as { lines?: number[] } | undefined)?.lines ?? [];
+        return `${reader?.name ?? e.source}@[${lines.join(',')}]`;
+      })
+      .sort();
+  }
+
+  /** `<driver>@L<line>` for every drives edge into the named signal. */
+  function driversOf(graph: CodeGraph, name: string, file: string): string[] {
+    return graph
+      .getIncomingEdges(signal(graph, name, file).id)
+      .filter((e) => e.kind === 'drives')
+      .map((e) => `${graph.getNode(e.source)?.name ?? e.source}@L${e.line}`)
+      .sort();
+  }
+
+  it('never reports an assignment target as a read of itself', async () => {
+    // The bug this feature exists to prevent: if "any identifier under the
+    // statement" counted as a read, `q <= d` would make q a reader of q, and
+    // "what reads q" would return q's own writer.
+    cg = await indexFiles({
+      'ff.v': `
+module ff(input clk, input d, output reg q);
+  always @(posedge clk) q <= d;
+endmodule
+`,
+    });
+    expect(readersOf(cg!, 'q', 'ff.v')).toEqual([]);
+    expect(readersOf(cg!, 'd', 'ff.v')).toEqual(['ff@[3]']);
+    expect(driversOf(cg!, 'q', 'ff.v')).toEqual(['ff@L3']);
+  });
+
+  it('captures sensitivity-list, condition, index, concat, ternary and argument reads', async () => {
+    cg = await indexFiles({
+      'r.v': `
+module r(input clk, input rstn, input [3:0] sel, input [7:0] a, input [7:0] b, output reg [7:0] y);
+  reg [7:0] mem [0:15];
+  always @(posedge clk or negedge rstn) begin
+    if (rstn) y <= sel[0] ? {a[3:0], b[3:0]} : mem[sel];
+  end
+  function [7:0] pick(input [7:0] v); pick = v; endfunction
+endmodule
+`,
+    });
+    // clk + rstn from the sensitivity list, rstn again from the condition,
+    // sel from both the ternary condition and the memory index, a and b from
+    // the concatenation.
+    expect(readersOf(cg!, 'clk', 'r.v')).toEqual(['r@[4]']);
+    expect(readersOf(cg!, 'rstn', 'r.v')).toEqual(['r@[4,5]']);
+    expect(readersOf(cg!, 'sel', 'r.v')).toEqual(['r@[5]']);
+    expect(readersOf(cg!, 'a', 'r.v')).toEqual(['r@[5]']);
+    expect(readersOf(cg!, 'b', 'r.v')).toEqual(['r@[5]']);
+  });
+
+  it('counts an index on the LEFT-hand side as a read of the index signal', async () => {
+    // `mem[sel] <= d` WRITES mem and READS sel. The grammar nests the index
+    // under its own primary even inside an lvalue, which is why anchoring on
+    // the parent construct gets this right without a special case.
+    cg = await indexFiles({
+      'w.v': `
+module w(input clk, input [3:0] sel, input [7:0] d);
+  reg [7:0] mem [0:15];
+  always @(posedge clk) mem[sel] <= d;
+endmodule
+`,
+    });
+    expect(readersOf(cg!, 'sel', 'w.v')).toEqual(['w@[4]']);
+    expect(readersOf(cg!, 'mem', 'w.v')).toEqual([]);
+    expect(driversOf(cg!, 'mem', 'w.v')).toEqual(['w@L4']);
+  });
+
+  it('aggregates every site of one (reader, net) pair into one edge with all lines', async () => {
+    cg = await indexFiles({
+      'agg.v': `
+module agg(input en, output reg x, output reg y, output reg z);
+  always @(*) begin
+    x = en;
+    y = ~en;
+    z = en & 1'b1;
+  end
+endmodule
+`,
+    });
+    expect(readersOf(cg!, 'en', 'agg.v')).toEqual(['agg@[4,5,6]']);
+    const edges = cg!
+      .getIncomingEdges(signal(cg!, 'en', 'agg.v').id)
+      .filter((e) => e.kind === 'reads');
+    expect(edges.length).toBe(1); // one edge, not one per site
+    expect(edges[0]!.line).toBe(4); // anchored at the first site
+  });
+
+  it('grows the line list on re-index rather than leaving it stale', async () => {
+    cg = await indexFiles({
+      'grow.v': `
+module grow(input en, output reg x, output reg y);
+  always @(*) begin
+    x = en;
+  end
+endmodule
+`,
+    });
+    expect(readersOf(cg!, 'en', 'grow.v')).toEqual(['grow@[4]']);
+
+    // Add a second read BELOW the first. INSERT OR IGNORE against the identity
+    // index would keep the old one-element list forever.
+    //
+    // A FULL re-index, not sync(): the incremental path resolves only the
+    // changed files' refs through the generic resolver and never runs the SV
+    // post-passes at all, so it drops `drives` the same way it drops `reads`.
+    // That is a pre-existing limitation of every SV marker pass, out of scope
+    // here.
+    fs.writeFileSync(
+      path.join(tempDir, 'grow.v'),
+      `
+module grow(input en, output reg x, output reg y);
+  always @(*) begin
+    x = en;
+    y = ~en;
+  end
+endmodule
+`
+    );
+    await cg!.indexAll();
+    cg!.resolveReferences();
+    expect(readersOf(cg!, 'en', 'grow.v')).toEqual(['grow@[4,5]']);
+  });
+
+  it('leaves the driver answer intact for a net that is both read and driven', async () => {
+    // A read and a drive on the same net share a SOURCE (the module does both).
+    // If `reads` joined the caller traversal, its visited-set would keep only
+    // one of them and "what drives this net" would start returning a reader.
+    cg = await indexFiles({
+      'both.v': `
+module both(input clk, output reg [7:0] cnt);
+  always @(posedge clk) cnt <= cnt + 1;
+endmodule
+`,
+    });
+    expect(driversOf(cg!, 'cnt', 'both.v')).toEqual(['both@L3']);
+    expect(readersOf(cg!, 'cnt', 'both.v')).toEqual(['both@[3]']);
+
+    // getCallers is the driver answer's surface; it must still report the drive.
+    const callers = cg!
+      .getCallers(signal(cg!, 'cnt', 'both.v').id)
+      .map((c) => `${c.node.name}:${c.edge.kind}`);
+    expect(callers).toContain('both:drives');
+    expect(callers.some((c) => c.endsWith(':reads'))).toBe(false);
+  });
+
+  it('binds a read to the reading module, never to a same-named net elsewhere', async () => {
+    cg = await indexFiles({
+      'a.v': `
+module a(input en, output reg x);
+  always @(*) x = en;
+endmodule
+`,
+      'b.v': `
+module b(input en, output reg x);
+  always @(*) x = ~en;
+endmodule
+`,
+    });
+    expect(readersOf(cg!, 'en', 'a.v')).toEqual(['a@[3]']);
+    expect(readersOf(cg!, 'en', 'b.v')).toEqual(['b@[3]']);
+  });
+
+  it('drops a hierarchical read and leaves no marker behind', async () => {
+    cg = await indexFiles({
+      'tb.sv': `
+module tb;
+  reg rstn;
+  initial if (dut.rstn) rstn = 1'b0;
+endmodule
+`,
+    });
+    // `dut.rstn` names another module's signal; guessing the local `rstn`
+    // would invent a fact.
+    expect(readersOf(cg!, 'rstn', 'tb.sv')).toEqual([]);
+
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_read__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    expect(left).toEqual([]);
+  });
+});
+
 describe('SystemVerilog driver edges — module-scoped binding', () => {
   let tempDir: string;
   let cg: CodeGraph | undefined;
