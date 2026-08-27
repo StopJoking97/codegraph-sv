@@ -68,6 +68,9 @@ export const EDGE_KINDS = [
   'overrides',       // Method overrides parent method
   'decorates',       // Decorator applied to symbol
   'drives',          // HDL: a scope drives a signal (assign / always target)
+  'connects',        // HDL: an instance port connection (actual net <-> formal port)
+  'reads',           // HDL: a scope reads a signal (expression / sensitivity / index)
+  'hier_ref',        // HDL: a dotted hierarchical path resolved to the signal it names
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];
