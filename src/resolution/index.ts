@@ -1934,8 +1934,14 @@ export class ReferenceResolver {
    *      declare `module tb`;
    *   4. otherwise the root matches a module by name — the elaboration top —
    *      but ONLY when exactly one module of the SAME LANGUAGE carries that
-   *      name. Two same-named modules, or a `module` node from another language
-   *      (terraform and cobol also emit kind 'module'), emit NOTHING;
+   *      name AND no declaration in that language carries it too. Two
+   *      same-named modules, a `module` node from another language (terraform
+   *      and cobol also emit kind 'module'), or a name that is also a signal or
+   *      parameter somewhere in the design, all emit NOTHING. That last clause
+   *      is rule 1's backstop: rule 1 only sees the emitting scope's DIRECT
+   *      children, so a package-imported or `` `include ``-d subject reaches
+   *      here, and binding it to a same-named module would fabricate a
+   *      cross-module driver out of a plain member select;
    *   5. otherwise nothing is emitted.
    *
    * Rules 1-3 exist because the original order asked the GLOBAL module table
@@ -2017,16 +2023,33 @@ export class ReferenceResolver {
       }
 
       // 4. The elaboration top, by name — but only when the name identifies ONE
-      //    module in this language. Ambiguity emits nothing: the feature has no
-      //    guessing mode, and picking a row order is guessing.
+      //    module in this language AND names no declaration anywhere in it.
+      //    Ambiguity emits nothing: the feature has no guessing mode, and
+      //    picking a row order is guessing.
       //    `ref.language` is stamped from the emitting file's detected language
       //    at extraction time (extraction/index.ts, validRefs), so an absent
       //    one filters to nothing — the safe direction for this pass.
+      //
+      //    The declaration half of that test is what keeps rule 1 honest. Rule 1
+      //    reads the emitting scope's DIRECT `contains` children, so a root that
+      //    is a real local subject but is not parented by that scope — a
+      //    package-imported variable (child of the `namespace`), a declaration
+      //    pulled in by `` `include `` (child of the header's own `file` node),
+      //    anything written from a subroutine scope — slips past it and lands
+      //    here, where a same-named module would turn a plain member select into
+      //    a fabricated cross-module `drives` edge. Widening rule 1 to a full
+      //    visibility walk would let more correct paths through; refusing the
+      //    global bind is what stops the WRONG ones, which is the half that has
+      //    to be right.
       if (!current) {
         const named = this.queries
           .getNodesByName(root)
-          .filter((n) => n.kind === 'module' && n.language === ref.language);
-        if (named.length === 1) current = named[0]!.id;
+          .filter((n) => n.language === ref.language);
+        const modules = named.filter((n) => n.kind === 'module');
+        const shadowed = named.some((n) =>
+          ReferenceResolver.SV_BINDABLE_MEMBER_KINDS.has(n.kind)
+        );
+        if (modules.length === 1 && !shadowed) current = modules[0]!.id;
       }
 
       if (!current) continue; // no unambiguous root -> nothing

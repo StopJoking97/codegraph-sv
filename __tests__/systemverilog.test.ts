@@ -1844,6 +1844,58 @@ endmodule
     expect(pathsFrom(cg!, 'a')).toEqual([]);
   });
 
+  it('drops a member select whose subject came from an imported package, not the module', async () => {
+    // The local-member rule reads the emitting scope's DIRECT `contains`
+    // children. A package-imported subject is parented by the `namespace`, so it
+    // slips past that rule and reaches the global module lookup — which is
+    // exactly where the fabricated cross-module driver came from. Same write,
+    // same collision, different parent.
+    cg = await indexFiles({
+      'cfg_pkg.sv': `
+package cfg_pkg;
+  typedef struct packed { logic valid; logic [7:0] data; } bus_t;
+  bus_t bus;
+endpackage
+`,
+      'a.sv': `
+module a;
+  import cfg_pkg::*;
+  always_comb bus.valid = 1'b1;
+endmodule
+`,
+      'bus.sv': `
+module bus(input clk, output reg valid);
+  always @(posedge clk) valid <= 1'b1;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'a')).toEqual([]);
+  });
+
+  it('drops a member select whose subject was declared at file scope, not in the module', async () => {
+    // The other way past the local-member rule: a declaration pulled in by
+    // `` `include `` is a child of the HEADER's file node, never of the module
+    // doing the writing. Not a corner case — real RTL carries many
+    // declarations parented directly by a file node.
+    cg = await indexFiles({
+      'sigs.vh': `
+bus_t bus;
+`,
+      'm.sv': `
+module m;
+  \`include "sigs.vh"
+  always_comb bus.valid = 1'b1;
+endmodule
+`,
+      'bus.sv': `
+module bus(input clk, output reg valid);
+  always @(posedge clk) valid <= 1'b1;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'm')).toEqual([]);
+  });
+
   it('keeps an absolute probe inside its own design when two designs share a top name', async () => {
     // `module tb` in two designs is routine in verification repos. Binding the
     // root by global name took the first in file-path order, so design B's probe
