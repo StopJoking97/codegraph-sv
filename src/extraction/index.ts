@@ -2672,21 +2672,40 @@ export class ExtractionOrchestrator {
     crossFileOutgoingConnects: Array<Edge & { sourceName: string; sourceKind: string }>,
     validNodes: Node[]
   ): void {
-    const newNodesByKindName = new Map<string, string>();
+    // (kind, name) does NOT identify a port. Legacy Verilog re-declares an
+    // output as a net so a procedural block can drive it — `module m(y); output
+    // y; reg y;` — leaving TWO `field:y` nodes in one file, and many output
+    // connections in real RTL sit on that shape. A
+    // last-write-wins map keeps whichever the walk saw last, which is the
+    // internal register, so the connection would come back sourced at the reg
+    // and the PORT would keep no outgoing edge at all: the very gap this rescue
+    // exists to close, silently reproduced for every output port of that shape. Keep every
+    // candidate and let the direction decorator pick, exactly as buildPortMap
+    // does on the resolution side.
+    const newNodesByKindName = new Map<string, Node[]>();
     for (const n of validNodes) {
-      newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+      const key = `${n.kind}\0${n.name}`;
+      const bucket = newNodesByKindName.get(key);
+      if (bucket) bucket.push(n);
+      else newNodesByKindName.set(key, [n]);
     }
     const reinserted: Edge[] = [];
     for (const e of crossFileOutgoingConnects) {
-      if ((e.metadata as { portDirection?: string } | undefined)?.portDirection !== 'output') {
-        continue;
-      }
+      const direction = (e.metadata as { portDirection?: string } | undefined)?.portDirection;
+      if (direction !== 'output') continue;
       // The TARGET (the parent's net) was never touched, so its id still
       // stands; only the source port was re-created under a new id.
-      const newSourceId = newNodesByKindName.get(`${e.sourceKind}\0${e.sourceName}`);
-      if (!newSourceId) continue; // port renamed or removed — staying dropped is correct
+      const candidates = newNodesByKindName.get(`${e.sourceKind}\0${e.sourceName}`) ?? [];
+      // A port carries its direction as a decorator, so requiring the match also
+      // re-validates the connection instead of trusting the name. If the port
+      // was renamed, removed, flipped to another direction, or demoted to a
+      // plain internal signal, nothing matches and the edge stays dropped —
+      // which is what a full re-index would decide too. Re-attaching on the name
+      // alone would trade the old false negative for a fabricated netlist edge.
+      const port = candidates.find((n) => n.decorators?.includes(direction));
+      if (!port) continue;
       reinserted.push({
-        source: newSourceId,
+        source: port.id,
         target: e.target,
         kind: e.kind,
         metadata: e.metadata,

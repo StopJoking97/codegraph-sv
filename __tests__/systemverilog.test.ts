@@ -1319,6 +1319,67 @@ endmodule
     expect(connectionsOf(cg!)).toEqual(before);
   });
 
+  it('re-sources a child edit at the PORT, not at a same-named internal register', async () => {
+    // `module m(y); output y; reg y;` is ordinary legacy Verilog — the output is
+    // re-declared as a net so a procedural block can drive it — and it leaves
+    // TWO `field:y` nodes in one file. Real RTL has many
+    // output connections on that shape. A rescue keyed on (kind, name) keeps
+    // whichever node the walk saw last, which is the register, so the connection
+    // came back sourced at the reg while the PORT kept no outgoing edge: the gap
+    // the rescue exists to close, reproduced for every output port of that shape.
+    //
+    // The previous test could not see this. It preserved every line number, so
+    // no node id moved and the stale edge stayed valid, and it rendered
+    // qualifiedName, which is `child::y` for the port and the register alike.
+    cg = await indexFiles({
+      'child.v': `
+module child(input clk, output y);
+  reg y;
+  always @(posedge clk) y <= 1'b1;
+endmodule
+`,
+      'top.v': `
+module top;
+  wire sys_clk, out1;
+  child u_a (.clk(sys_clk), .y(out1));
+endmodule
+`,
+    });
+
+    /** The node an output-direction connection is sourced at, with its decorators. */
+    const outputSource = (): { name: string; decorators: string[] } | undefined => {
+      for (const n of cg!.getNodesByKind('field')) {
+        for (const e of cg!.getOutgoingEdges(n.id)) {
+          if (e.kind !== 'connects') continue;
+          if ((e.metadata as { portDirection?: string } | undefined)?.portDirection !== 'output') continue;
+          const src = cg!.getNode(e.source);
+          return { name: src?.name ?? '?', decorators: src?.decorators ?? [] };
+        }
+      }
+      return undefined;
+    };
+
+    expect(outputSource()).toEqual({ name: 'y', decorators: expect.arrayContaining(['output']) });
+
+    // Edit the CHILD, and shift its lines so every node id in it actually moves.
+    fs.writeFileSync(
+      path.join(tempDir, 'child.v'),
+      `
+// touched
+module child(input clk, output y);
+  reg y;
+  always @(posedge clk) y <= 1'b1;
+endmodule
+`
+    );
+    await cg!.sync();
+
+    // Still one output connection, still sourced at the PORT.
+    const after = outputSource();
+    expect(after).toBeDefined();
+    expect(after!.decorators).toContain('output');
+  });
+
   it('resolves positional connections, and a skipped one does not shift the rest', async () => {
     // `child u (sys_clk, , out1, sda_bus)` leaves port 1 (`d`) unconnected.
     // The grammar emits NO node for the empty slot, so counting connections by
