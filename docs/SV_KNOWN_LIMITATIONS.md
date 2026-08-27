@@ -83,10 +83,22 @@ Incremental `sync` now runs the SV post-passes, so day-to-day edits no longer dr
 
 ---
 
+## Correction to an earlier count in this document's first revision
+
+An earlier revision said exactly one open finding changes what the graph *contains*. **It is at
+least two.** `[extraction 4]` fabricates port direction for a headerless first ANSI port and for
+interface ports, and direction picks the `connects` arrow orientation — so it can produce an edge
+pointing the wrong way, not merely a reporting inaccuracy.
+
+Exposure: the interface-port half fires only on a design that declares `interface` ports. The
+headerless-ANSI half is **unquantified**: separating it from Verilog-1995 non-ANSI port lists, a
+different code path, has not been measured. Until it is, treat `connects` arrow direction on
+modules with headerless ANSI or interface ports as unverified. `drives` is unaffected.
+
 ## Where the full finding list lives
 
 - Tracked as issues #1–#8 of this repository.
 
-Of the 24 findings open at the time of writing, exactly one — item 1 above — changes what the
-graph *contains*. The rest change what `verify` *reports*, or are robustness, residual, and
-documentation-accuracy work. None of them can produce a wrong edge.
+Of the 21 findings open at the time of writing, **two** — item 1 above and `[extraction 4]` — can
+change what the graph *contains*. The other 19 change what `verify` *reports*, or are robustness,
+residual, and documentation-accuracy work, and cannot produce a wrong edge.
