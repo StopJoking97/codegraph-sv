@@ -377,10 +377,26 @@ describe('verify — degradation paths (no grader installed)', () => {
     expect(text).toContain('SKIPPED');
     expect(text).toContain('pyslang');
     expect(text).toContain('41');
-    // Never blocking, even in strict mode: a teammate without the grader must
-    // not be stopped by it.
-    expect(verifyExitCode(outcome, true)).toBe(0);
+    // Never blocking in the DEFAULT mode: a teammate without the grader must not
+    // be stopped by it.
     expect(verifyExitCode(outcome, false)).toBe(0);
+  });
+
+  it('FAILS a skip under --strict, because a skip proves nothing', () => {
+    // The false-green: with a success exit code on skip, a CI image that loses
+    // pyslang greens the gate forever, indistinguishable from "graded and clean".
+    const outcome = {
+      status: 'skipped' as const,
+      reason: 'pyslang is not installed (pip install "pyslang==11.*")',
+      staleFiles: [],
+      scopedFiles: 41,
+    };
+    expect(verifyExitCode(outcome, true)).toBe(1);
+    const text = formatVerifyReport(outcome, true);
+    expect(text).toContain('STRICT: failing');
+    expect(text).toContain('NOTHING was verified');
+    // The default rendering must NOT claim a strict failure.
+    expect(formatVerifyReport(outcome, false)).not.toContain('STRICT');
   });
 
   it('still reports stale index entries when the grader is unavailable', () => {
@@ -399,14 +415,15 @@ describe('verify — degradation paths (no grader installed)', () => {
 
 describe('verify — report rendering and exit codes', () => {
   const okOutcome = (
-    over: Partial<{ missing: number; unexplained: number; configured: boolean; version: string; notes: string[] }> = {}
+    over: Partial<{ missing: number; unexplained: number; configured: boolean; version: string; notes: string[]; graded: number }> = {}
   ) => {
     const missing = over.missing ?? 0;
+    const graded = over.graded ?? 10;
     const files: FileVerdict[] = [
       {
         file: 'a.v',
-        graded: 10,
-        hit: 10 - missing,
+        graded,
+        hit: graded - missing,
         disagreements: [
           ...Array.from({ length: missing }, (_, i) => ({
             file: 'a.v',
@@ -486,6 +503,21 @@ describe('verify — report rendering and exit codes', () => {
     // UNEXPLAINED is a tripwire for the classifier, not a recall bug, so it does
     // not fail the build on its own.
     expect(verifyExitCode(okOutcome({ unexplained: 3 }), true)).toBe(0);
+  });
+
+  it('FAILS a zero-graded run under --strict instead of scoring it 100%', () => {
+    // A ratio over an empty population is not a perfect score, it is no
+    // measurement — an exclude glob that empties the population must not green.
+    const empty = okOutcome({ graded: 0 });
+    expect(verifyExitCode(empty, true)).toBe(1);
+    expect(verifyExitCode(empty, false)).toBe(0);
+  });
+
+  it('prints an empty graded population as NOT MEASURED, never as 100.0%', () => {
+    const text = formatVerifyReport(okOutcome({ graded: 0 }), true);
+    expect(text).toContain('0 / 0   NOT MEASURED');
+    expect(text).not.toContain('100.0%');
+    expect(text).toContain('STRICT: failing — 0 declarations were graded');
   });
 
   it('lists MISSING and UNEXPLAINED names so they can be acted on', () => {

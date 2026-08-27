@@ -58,11 +58,23 @@ PROTOCOL = 1
 # reading below handles both shapes — reading only `.valueText` silently dropped
 # every subroutine name and made the classifier's UNEXPLAINED tripwire fire on
 # tasks the index had correctly indexed.
+#
+# Package, interface and program headers, and typedefs, are here for the same
+# reason: CodeGraph indexes all four (package -> namespace, interface ->
+# interface, program -> module, typedef -> type_alias/enum), so leaving them out
+# of the oracle understated the denominator — those names could never be scored
+# MISSING, and on the index side they landed in UNEXPLAINED or were absorbed by
+# BRANCH-UNION inside include guards. Grading a population smaller than the one
+# the index actually serves is the failure this whole pass exists to prevent.
 DECL_KINDS = {"SyntaxKind.Declarator"}
 HEADER_KINDS = {
     "SyntaxKind.ModuleHeader",
     "SyntaxKind.ClassDeclaration",
     "SyntaxKind.FunctionPrototype",
+    "SyntaxKind.PackageHeader",
+    "SyntaxKind.InterfaceHeader",
+    "SyntaxKind.ProgramHeader",
+    "SyntaxKind.TypedefDeclaration",
 }
 
 # A subroutine's OWN name is design scope even though everything declared inside

@@ -1939,15 +1939,18 @@ program
  * subcommand rather than a flag on indexing: grading must be runnable without
  * re-indexing, which is the whole point of it being a standing property.
  *
- * Its exit code is 0 for everything except `--strict` with a real MISSING.
- * Absence of the grader, a grader failure and a grader timeout all print a skip
- * and exit 0 — a verification pass that can block a teammate is worse than no
- * verification pass.
+ * WITHOUT `--strict` its exit code is always 0: absence of the grader, a grader
+ * failure and a grader timeout all print a skip and exit 0 — a verification
+ * pass that can block a teammate is worse than no verification pass.
+ *
+ * WITH `--strict` it exits non-zero on a real MISSING, on a skip, and on a run
+ * that graded zero declarations. Strict mode is asked to prove the index, and a
+ * run that never measured anything has not proven it.
  */
 program
   .command('verify [path]')
   .description('Grade the index against an independent compiler front-end (SystemVerilog)')
-  .option('-s, --strict', 'Exit non-zero when any declaration is MISSING (for CI)')
+  .option('-s, --strict', 'Exit non-zero on any MISSING, on a skip, or if nothing was graded (for CI)')
   .option('-j, --json', 'Output as JSON')
   .option('-t, --timeout <ms>', 'Grader budget in milliseconds')
   .action(async (

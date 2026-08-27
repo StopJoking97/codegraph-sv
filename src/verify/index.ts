@@ -20,8 +20,15 @@
  *      Extraction stays tree-sitter-based and keeps indexing the union of all
  *      conditional-compilation branches, because a code-intelligence tool must
  *      be able to find code in a branch that is not currently compiled.
- *   3. Every degradation path is a printed SKIP with a success exit code. A
- *      verification pass that can block a teammate is worse than none.
+ *   3. In the DEFAULT mode every degradation path is a printed SKIP with a
+ *      success exit code. A verification pass that can block a teammate is
+ *      worse than none.
+ *   4. `--strict` inverts property 3 on purpose, because it means something
+ *      different: "prove it". A skip, or a run that graded zero declarations,
+ *      is NOT a pass in strict mode — it is the absence of evidence, and the
+ *      exit code has to be able to say so. Otherwise a CI image that loses
+ *      pyslang, or an exclude glob that empties the population, greens the gate
+ *      forever with an exit code indistinguishable from "graded and clean".
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -70,7 +77,11 @@ const GRADED_NODE_KINDS = [
 export const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
 
 export interface VerifyOptions {
-  /** Exit non-zero on any MISSING. For CI. */
+  /**
+   * Demand evidence. Exits non-zero on any MISSING, and also when the oracle
+   * never ran (skip) or graded nothing — in strict mode an ungraded run is a
+   * failure, not a pass. For CI.
+   */
   strict?: boolean;
   timeoutMs?: number;
 }
@@ -238,11 +249,15 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
     }
     lines.push('');
     lines.push('  Install the grader with: pip install "pyslang==11.*"');
+    if (strict) {
+      lines.push('');
+      lines.push('  STRICT: failing — the oracle never ran, so NOTHING was verified.');
+      lines.push('  A skip is a pass only in the default mode; --strict asks for evidence.');
+    }
     return lines.join('\n');
   }
 
   const { result, report } = outcome;
-  const pct = result.graded > 0 ? (100 * result.hit) / result.graded : 100;
 
   lines.push(`codegraph verify — graded by ${report.oracle} ${report.version} (${report.mode})`);
   if (!outcome.configured) {
@@ -251,7 +266,19 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
   }
   lines.push(`  scoped: ${outcome.scopedFiles} SystemVerilog files in the index; ${Object.keys(report.files).length} graded`);
   lines.push('');
-  lines.push(`  DESIGN-SCOPE RECALL   ${result.hit} / ${result.graded}   ${pct.toFixed(1)}%`);
+
+  // A ratio over an empty population is not 100% — it is no measurement. Print
+  // the absence rather than a perfect score the run did not earn.
+  if (result.graded === 0) {
+    lines.push('  DESIGN-SCOPE RECALL   0 / 0   NOT MEASURED — the graded population is EMPTY.');
+    lines.push('  The oracle ran but produced no declaration to grade, so this run says');
+    lines.push('  nothing about the index. Usual causes: every scoped file was excluded by a');
+    lines.push('  `verify.exclude` glob, the index holds no SystemVerilog, or the grader could');
+    lines.push('  not parse anything it was given.');
+  } else {
+    const pct = (100 * result.hit) / result.graded;
+    lines.push(`  DESIGN-SCOPE RECALL   ${result.hit} / ${result.graded}   ${pct.toFixed(1)}%`);
+  }
   lines.push(`    MISSING       ${result.missing}   (grader has it, index does not — a real recall bug)`);
   lines.push(`    BRANCH-UNION  ${result.branchUnion}   (index has it, grader does not, inside a conditional region — expected)`);
   lines.push(`    UNEXPLAINED   ${result.unexplained}   (the tripwire — a non-zero here means the classifier needs work)`);
@@ -305,13 +332,29 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
     lines.push(`  STRICT: failing on ${result.missing} MISSING declaration(s).`);
   }
 
+  if (strict && result.graded === 0) {
+    lines.push('');
+    lines.push('  STRICT: failing — 0 declarations were graded, so the index is UNVERIFIED.');
+  }
+
   return lines.join('\n');
 }
 
-/** Process exit code for an outcome. A skip is always 0. */
+/**
+ * Process exit code for an outcome.
+ *
+ * Default mode never blocks: 0 for everything. `--strict` is the opposite
+ * contract — it fails on a real MISSING, on a skip (the oracle never ran), and
+ * on a graded population of zero (the oracle ran but measured nothing). The
+ * last two are the false-green: without them a CI image that loses pyslang, or
+ * an exclude glob that empties the population, exits 0 forever while proving
+ * nothing.
+ */
 export function verifyExitCode(outcome: VerifyOutcome, strict = false): number {
-  if (outcome.status === 'skipped') return 0;
-  return strict && outcome.result.missing > 0 ? 1 : 0;
+  if (!strict) return 0;
+  if (outcome.status === 'skipped') return 1;
+  if (outcome.result.graded === 0) return 1;
+  return outcome.result.missing > 0 ? 1 : 0;
 }
 
 export * from './classify';

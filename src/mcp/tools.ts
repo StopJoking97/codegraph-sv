@@ -1232,7 +1232,9 @@ export const tools: ToolDefinition[] = [
       properties: {
         strict: {
           type: 'boolean',
-          description: 'Report a failure verdict when any declaration is MISSING (default: false)',
+          description:
+            'Report a failure verdict when any declaration is MISSING, when the grader was ' +
+            'skipped, or when nothing was graded (default: false)',
           default: false,
         },
         timeoutMs: {
