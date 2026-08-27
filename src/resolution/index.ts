@@ -1637,6 +1637,57 @@ export class ReferenceResolver {
    *
    * Last write wins on a name collision, matching the previous inline behaviour.
    */
+  /**
+   * Every name that could be the real SUBJECT of a dotted path written in this
+   * scope — the thing that makes `bus.valid` a member select rather than a
+   * hierarchical path into `module bus`.
+   *
+   * Three sources, and each exists because a real shape falls through the ones
+   * before it:
+   *
+   *   - the scope's own `contains` children — the ordinary local declaration;
+   *   - every declaration in the SAME FILE, because a file-scope declaration is
+   *     parented by the `file` node, not by the module that writes it;
+   *   - the members of anything the scope `imports` — a package, whose members
+   *     belong to the `namespace`, or a resolved `` `include ``, whose members
+   *     belong to the header's own `file` node.
+   *
+   * SCOPE is the whole point. An earlier version of this test asked whether the
+   * name existed ANYWHERE in the index, which did stop the fabricated edge but
+   * bought it at a price nobody would agree to: a single
+   * `` `define top `` in any header could have silently deleted nearly every
+   * hierarchical edge, because a design's top module roots nearly all of them
+   * and a global test cannot tell an unrelated same-named signal from the
+   * subject in front of it. A declaration in some other module is not visible
+   * here and must not vote on what this scope meant.
+   */
+  private buildVisibleSubjectNames(scopeId: string, cache: Map<string, Set<string>>): Set<string> {
+    const cached = cache.get(scopeId);
+    if (cached) return cached;
+
+    const names = new Set<string>();
+    const addChildren = (id: string): void => {
+      for (const e of this.queries.getOutgoingEdges(id, ['contains'])) {
+        const child = this.queries.getNodeById(e.target);
+        if (child && ReferenceResolver.SV_HIER_LEAF_KINDS.has(child.kind)) names.add(child.name);
+      }
+    };
+
+    addChildren(scopeId);
+
+    const from = this.queries.getNodeById(scopeId);
+    if (from?.filePath) {
+      for (const n of this.queries.getNodesByFile(from.filePath)) {
+        if (ReferenceResolver.SV_HIER_LEAF_KINDS.has(n.kind)) names.add(n.name);
+      }
+    }
+
+    for (const e of this.queries.getOutgoingEdges(scopeId, ['imports'])) addChildren(e.target);
+
+    cache.set(scopeId, names);
+    return names;
+  }
+
   private buildMemberMap(
     scopeId: string,
     cache: Map<string, Map<string, string>>,
@@ -1747,8 +1798,21 @@ export class ReferenceResolver {
    * name. A marker whose edge never materialised (an unresolvable module type)
    * simply patches nothing and is dropped, like every other unbindable marker.
    */
+  /**
+   * Instance labels seen by the most recent {@link resolveSvInstanceNames} run,
+   * per emitting scope — including the ones whose module type never resolved,
+   * which is the only place those survive at all.
+   *
+   * The two passes are coupled on purpose and always run together in
+   * `runSvPostPasses`, instance names first. Calling `resolveSvHierRefEdges`
+   * on its own leaves this empty, which costs the unresolved-instance guard
+   * below and nothing else.
+   */
+  private svInstanceLabels = new Map<string, Set<string>>();
+
   resolveSvInstanceNames(): number {
     const PREFIX = '__sv_inst__'; // mirrors SV_INST_PREFIX in the extractor
+    this.svInstanceLabels.clear();
     const candidates = this.queries
       .getUnresolvedReferences()
       .filter((ref) => ref.referenceKind === 'references' && ref.referenceName.startsWith(PREFIX));
@@ -1774,6 +1838,20 @@ export class ReferenceResolver {
       });
       const instance = ref.referenceName.slice(PREFIX.length);
       if (!instance) continue;
+      // Keep the label for the hierarchical pass, which runs after this one and
+      // after these markers are deleted. An instance gets no node of its own and
+      // its label reaches the graph only as `instantiates` edge metadata — which
+      // exists only if the instantiated module resolved. A vendor cell outside
+      // the index never resolves, so without this map its label is invisible to
+      // every rule downstream and `bus.valid` on a `vendor_ip bus(...)` falls
+      // through to the global module lookup, where a same-named `module bus` is
+      // waiting to become a fabricated cross-module driver.
+      let labels = this.svInstanceLabels.get(ref.fromNodeId);
+      if (!labels) {
+        labels = new Set<string>();
+        this.svInstanceLabels.set(ref.fromNodeId, labels);
+      }
+      labels.add(instance);
       patches.push({
         source: ref.fromNodeId,
         kind: 'instantiates',
@@ -1985,7 +2063,7 @@ export class ReferenceResolver {
     >();
     const edges: Edge[] = [];
     const instancesByModule = new Map<string, Map<string, string>>();
-    const membersByScope = new Map<string, Map<string, string>>();
+    const visibleByScope = new Map<string, Set<string>>();
 
     for (const ref of candidates) {
       deleteKeys.set(`${ref.fromNodeId}|${ref.referenceName}`, {
@@ -2004,10 +2082,13 @@ export class ReferenceResolver {
       // --- root: innermost scope outwards, never the global table first ------
       const root = segments[0]!;
 
-      // 1. A member of the emitting scope. `bus.valid` on a local `bus_t bus`
-      //    is a member select, not a hierarchical path — drop it. Binding it
-      //    would fabricate a cross-module driver out of a plain local write.
-      if (this.buildMemberMap(ref.fromNodeId, membersByScope).has(root)) continue;
+      // 1. A declaration VISIBLE to the emitting scope. `bus.valid` on a local
+      //    `bus_t bus` is a member select, not a hierarchical path — drop it.
+      //    Binding it would fabricate a cross-module driver out of a plain local
+      //    write. "Visible" is the scope's own members, everything declared in
+      //    the same file, and the members of whatever it imports; see
+      //    buildVisibleSubjectNames for why each source is needed.
+      if (this.buildVisibleSubjectNames(ref.fromNodeId, visibleByScope).has(root)) continue;
 
       // 2. An instance declared in the emitting scope — a relative path.
       let current: string | undefined = this.buildInstanceMap(
@@ -2022,6 +2103,15 @@ export class ReferenceResolver {
         if (from && from.kind === 'module' && from.name === root) current = from.id;
       }
 
+      // 3b. An instance whose MODULE TYPE is not in the index. Rule 2 walks
+      //     `instantiates` edges, which exist only for a module that resolved,
+      //     so a vendor cell outside the index leaves its instance label
+      //     nowhere in the graph — and the path falls to rule 4, where a
+      //     same-named module fabricates the edge. The path cannot be followed
+      //     (there is nothing to follow it into), so this is a DROP, not a bind:
+      //     silent beats wrong.
+      if (!current && this.svInstanceLabels.get(ref.fromNodeId)?.has(root)) continue;
+
       // 4. The elaboration top, by name — but only when the name identifies ONE
       //    module in this language AND names no declaration anywhere in it.
       //    Ambiguity emits nothing: the feature has no guessing mode, and
@@ -2030,29 +2120,18 @@ export class ReferenceResolver {
       //    at extraction time (extraction/index.ts, validRefs), so an absent
       //    one filters to nothing — the safe direction for this pass.
       //
-      //    The declaration half of that test is what keeps rule 1 honest. Rule 1
-      //    reads the emitting scope's DIRECT `contains` children, so a root that
-      //    is a real local subject but is not parented by that scope — a
-      //    package-imported variable (child of the `namespace`), a declaration
-      //    pulled in by `` `include `` (child of the header's own `file` node),
-      //    anything written from a subroutine scope — slips past it and lands
-      //    here, where a same-named module would turn a plain member select into
-      //    a fabricated cross-module `drives` edge. Widening rule 1 to a full
-      //    visibility walk would let more correct paths through; refusing the
-      //    global bind is what stops the WRONG ones, which is the half that has
-      //    to be right.
+      //    Rule 1 is what protects this one, and it has to do it by VISIBILITY,
+      //    not by a global name test. A version of this pass asked whether the
+      //    root named a declaration anywhere in the index; it stopped the
+      //    fabricated edge, and it would also have deleted nearly every
+      //    hierarchical edge the moment anyone wrote `` `define
+      //    top `` in any header, because the top module is the root of nearly all
+      //    of them. A declaration this scope cannot see does not get a vote.
       if (!current) {
         const named = this.queries
           .getNodesByName(root)
-          .filter((n) => n.language === ref.language);
-        const modules = named.filter((n) => n.kind === 'module');
-        // The LEAF kinds, not the bindable-member kinds: the question here is
-        // "could this name be the real subject of a dotted path?", and a
-        // `function`/`method` answers yes just as a signal does. Using the
-        // narrower member set would let `module my_task` capture a path rooted
-        // at a same-named subroutine.
-        const shadowed = named.some((n) => ReferenceResolver.SV_HIER_LEAF_KINDS.has(n.kind));
-        if (modules.length === 1 && !shadowed) current = modules[0]!.id;
+          .filter((n) => n.kind === 'module' && n.language === ref.language);
+        if (named.length === 1) current = named[0]!.id;
       }
 
       if (!current) continue; // no unambiguous root -> nothing

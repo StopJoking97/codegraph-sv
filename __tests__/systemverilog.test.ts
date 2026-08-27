@@ -1950,6 +1950,55 @@ endmodule
     expect(pathsFrom(cg!, 'a')).toEqual([]);
   });
 
+  it('drops a member select on an instance whose module is not in the index', async () => {
+    // The subject is an INSTANCE, and instances get no node of their own — the
+    // label lives in the `instantiates` edge's metadata, which only exists once
+    // the instantiated module resolves. A vendor cell outside the index never
+    // resolves, so the label is invisible to every rule, and the root falls
+    // through to the global module lookup where a same-named module is waiting.
+    cg = await indexFiles({
+      'm.sv': `
+module m;
+  vendor_ip bus(.clk(1'b0));
+  always_comb bus.valid = 1'b1;
+endmodule
+`,
+      'bus.sv': `
+module bus(input clk, output reg valid);
+  always @(posedge clk) valid <= 1'b1;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'm')).toEqual([]);
+  });
+
+  it('still resolves a probe when an unrelated module happens to declare the same name', async () => {
+    // The cost of getting the member-select test wrong in the other direction.
+    // A test that asks "does this name exist ANYWHERE in the index" stops the
+    // fabricated edge and takes the legitimate ones with it: a design's top
+    // module roots nearly every hierarchical edge, so one `reg top`
+    // or `` `define top `` in any file would have deleted all of them, with
+    // no error and no marker left behind to notice. Visibility is scoped for
+    // this reason — a declaration in a module this scope cannot see does not get
+    // a vote on what this scope meant.
+    cg = await indexFiles({
+      ...DESIGN,
+      'other.sv': `
+module other;
+  reg top_dut;
+  always_comb top_dut = 1'b0;
+endmodule
+`,
+      'tb.sv': `
+module tb;
+  reg clk;
+  initial if (top_dut.u_core.u_leaf.state == 8'h5) clk = 1'b0;
+endmodule
+`,
+    });
+    expect(pathsFrom(cg!, 'tb')).toEqual(['hier_ref top_dut.u_core.u_leaf.state -> leaf::state']);
+  });
+
   it('keeps an absolute probe inside its own design when two designs share a top name', async () => {
     // `module tb` in two designs is routine in verification repos. Binding the
     // root by global name took the first in file-path order, so design B's probe
