@@ -45,6 +45,64 @@ them on both sides, so they do not appear as false MISSINGs.
 
 ---
 
+## 1b. Do not net-trace through `codegraph_explore` — use the trace commands
+
+**What goes wrong.** For a net-tracing question ("who drives this", "who reads this bit", "what
+instantiates this"), the explore surface ranks by relevance and keeps a file budget. On exact
+symbol names it demonstrably ranks files containing **zero** occurrences of the symbol above the
+one file containing it, and the answer carries no signal that this happened. An explore query for
+an exact register-field name can show several files with 0 occurrences each and drop the sole
+consumer into the unshown overflow. This is finding `[retrieval 1]`.
+
+**The graph is not the problem.** Every edge checked in that test was exact. This is a retrieval defect sitting
+on top of correct data.
+
+**What to use instead.** Three commands that answer from edges alone — exact name lookup, every
+incident edge, no ranking and no budget, so the result is the complete set or an explicit refusal:
+
+```bash
+codegraph who-drives cfg_rx_en       -p <project>   # assignments + inbound port hookups
+codegraph who-reads  status_reg      -p <project>   # every read line + outbound hookups
+codegraph instances  sync_fifo       -p <project>   # every instantiation site
+```
+
+Each prints `file:line` of the *statement* (the `assign`, the hookup, the instantiation), never of
+a declaration. Each adds `-j/--json`. Two behaviours worth knowing:
+
+- **Absence is a result, with its denominator.** `instances sync_fifo` prints
+  `0 results — absence proven against <N> instantiates edges in this index`. That is the orphan-module
+  answer, and you can check the claim because the population it was checked against is stated.
+- **A name that is not indexed is reported differently from a name nothing touches.** `instances
+  MEM_B` says the name is not indexed and lists `MEM_B_64X32`; `instances
+  MEM_B_64X32` says the module exists and nothing instantiates it. Conflating those is how a
+  typo reads as a design finding.
+
+Sites the graph cannot orient — `hier_ref` dotted paths and `inout` hookups — are printed and
+flagged `[direction not distinguished]` rather than silently asserted as drivers.
+
+**Explore is still the right tool for "show me this module and how it works inside"**, which is what
+it measured well at: one call returns verbatim source with the relevant logic and the call path.
+
+---
+
+## 1c. An index that lacks an edge kind now REFUSES the question
+
+`who-drives`/`who-reads`/`instances` check the resolved index's edge census before answering and
+exit **2** with a message naming the index, its extraction version, its census, and the reachable
+index that does hold the missing edges. This exists because indexes of the same tree can differ:
+an index of a parent directory can cover the same modules, have been built at extraction 25,
+and hold **zero** `reads`, `connects` and `hier_ref` edges, so "who reads this bit" there is not a
+hard question — it is an unanswerable one that previously returned ranked files anyway.
+
+The MCP tools apply the same check as a banner prepended to the answer rather than a refusal (a
+partial-capability index can still be useful, and a general-purpose tool must not hard-fail on a
+repo whose owner never asked for HDL semantics).
+
+Related: `codegraph serve --mcp --path <dir>` now **pins** that index — a client-supplied `rootUri`
+no longer silently overrides it, and an override that is discarded is logged to stderr.
+
+---
+
 ## 2. `codegraph verify --strict` is not ready for CI when `includeDirs` is set
 
 **Symptom.** In preprocessed mode — the configuration the verify report
