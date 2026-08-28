@@ -91,6 +91,60 @@ function firstRootPath(result: unknown): string | null {
   return fileUriToPath(first.uri);
 }
 
+/** Outcome of {@link resolveExplicitProjectPath}. */
+export interface ProjectPathDecision {
+  /** The project to open, or null when nothing explicit is known yet. */
+  path: string | null;
+  /**
+   * The client root that was DISCARDED in favour of an operator `--path`, or
+   * null when nothing was overridden. Present so the override can be logged —
+   * it must never happen silently.
+   */
+  overrodeClientRoot: string | null;
+}
+
+/**
+ * Decide which project an MCP session serves, from the signals available at
+ * `initialize`. cwd is deliberately NOT considered here: it is deferred so a
+ * later `roots/list` answer can win over it (issue #196).
+ *
+ * Precedence, strongest first:
+ *   1. An OPERATOR-supplied `--path`. Someone who typed the index to serve
+ *      meant that index; `rootUri` is only whatever directory the editor
+ *      happens to have open. Ranking `rootUri` first made `--path`
+ *      unenforceable — a server launched pinned at an RTL index could still be
+ *      answered from the workspace index one level up, silently, which is the
+ *      wrong-index failure with the operator's explicit instruction discarded.
+ *   2. The client's `rootUri`, then its first `workspaceFolder`.
+ *   3. A daemon-supplied `--path` (see below).
+ *
+ * The daemon is excluded from the pin: `spawnDetachedDaemon` re-invokes the
+ * CLI with `--path <resolved root>` as an implementation detail, not as
+ * operator intent, and one daemon legitimately serves clients rooted
+ * elsewhere. `daemonInternal` is exactly that flag, so a daemon keeps the
+ * client-first precedence it has always had.
+ */
+export function resolveExplicitProjectPath(input: {
+  rootUri?: string;
+  workspaceFolderUri?: string;
+  launchPath: string | null;
+  daemonInternal: boolean;
+}): ProjectPathDecision {
+  const clientRoot = input.rootUri
+    ? fileUriToPath(input.rootUri)
+    : input.workspaceFolderUri
+      ? fileUriToPath(input.workspaceFolderUri)
+      : null;
+
+  if (input.launchPath && !input.daemonInternal) {
+    return {
+      path: input.launchPath,
+      overrodeClientRoot: clientRoot && clientRoot !== input.launchPath ? clientRoot : null,
+    };
+  }
+  return { path: clientRoot ?? input.launchPath ?? null, overrodeClientRoot: null };
+}
+
 export interface MCPSessionOptions {
   /**
    * Explicit project path from the `--path` CLI flag. When set, the session
@@ -217,17 +271,22 @@ export class MCPSession {
       };
     }
 
-    // Explicit project signal, strongest first: client-provided rootUri /
-    // workspaceFolders (LSP-style), else the --path the server was launched
-    // with. cwd is NOT used here — we defer it so a roots/list answer can
-    // win over it. See issue #196.
-    let explicitPath: string | null = null;
-    if (params?.rootUri) {
-      explicitPath = fileUriToPath(params.rootUri);
-    } else if (params?.workspaceFolders?.[0]?.uri) {
-      explicitPath = fileUriToPath(params.workspaceFolders[0].uri);
-    } else if (this.explicitProjectPath) {
-      explicitPath = this.explicitProjectPath;
+    const decision = resolveExplicitProjectPath({
+      rootUri: params?.rootUri,
+      workspaceFolderUri: params?.workspaceFolders?.[0]?.uri,
+      launchPath: this.explicitProjectPath,
+      daemonInternal: !!process.env.CODEGRAPH_DAEMON_INTERNAL,
+    });
+    const explicitPath = decision.path;
+    if (decision.overrodeClientRoot) {
+      // Never silent: an operator who pinned one index and a client that asked
+      // for another have a real disagreement, and the loser has to be nameable
+      // when an answer later looks wrong.
+      process.stderr.write(
+        `[CodeGraph MCP] Serving the --path index ${decision.path}; ` +
+        `ignoring the client's root ${decision.overrodeClientRoot}. ` +
+        `Drop --path to follow the client instead.\n`,
+      );
     }
 
     // Pick the instructions variant by the root's index state — synchronous
