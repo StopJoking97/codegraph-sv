@@ -7,6 +7,7 @@
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
+import { capabilityOf, capabilityGap, capabilityGapMessage, edgeKindsForQuery } from '../index-capability';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1811,6 +1812,59 @@ export class ToolHandler {
   }
 
   /**
+   * Annotate a result whose question the resolved index structurally cannot
+   * answer — the wrong-index guard, applied where the worktree and staleness
+   * notices are, so every tool inherits it.
+   *
+   * The failure it addresses: a server that resolved its index from the
+   * session cwd answers "who reads this register bit" out of an index holding
+   * ZERO `reads` edges. The ranked files it returns are not a weak answer,
+   * they are noise — and nothing in the response distinguishes them from a
+   * good answer. For example, a workspace
+   * index one level up from an RTL index may hold `drives` edges and zero
+   * `reads`/`connects`/`hier_ref`.
+   *
+   * The banner goes FIRST, before the results, because an agent that reads
+   * top-down must learn the answer is suspect before it reads the answer.
+   * It does not suppress the results: a partial-capability index can still be
+   * useful, and a hard block here would fire inside a general-purpose tool on
+   * a repo whose owner never asked for HDL semantics. The trace CLI commands,
+   * whose semantics are unambiguous, DO hard-block — see `runTrace`.
+   */
+  private withCapabilityNotice(
+    result: ToolResult,
+    args: Record<string, unknown>,
+  ): ToolResult {
+    if (result.isError) return result;
+    const query = typeof args.query === 'string' ? args.query
+      : typeof args.task === 'string' ? args.task
+      : typeof args.symbol === 'string' ? args.symbol
+      : null;
+    if (!query) return result;
+
+    try {
+      const required = edgeKindsForQuery(query);
+      if (required.length === 0) return result;
+      const cg = this.getCodeGraph(args.projectPath as string | undefined);
+      const gap = capabilityGap(capabilityOf(cg), required);
+      if (!gap) return result;
+
+      const notice = capabilityGapMessage(gap, { subject: query, retargetAs: 'projectPath' });
+      const [first, ...rest] = result.content;
+      if (first && first.type === 'text') {
+        return {
+          ...result,
+          content: [{ type: 'text', text: `${notice}\n\n${first.text}` }, ...rest],
+        };
+      }
+      return result;
+    } catch {
+      // A capability check must never fail a call that already succeeded.
+      return result;
+    }
+  }
+
+  /**
    * Annotate a successful read-tool result with per-file staleness — the
    * non-blocking answer to issue #403. The file watcher tracks every event
    * it sees per path; here we intersect "files referenced in this response"
@@ -2064,7 +2118,8 @@ export class ToolHandler {
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      const withCapability = this.withCapabilityNotice(result, args);
+      const withWorktree = this.withWorktreeNotice(withCapability, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
