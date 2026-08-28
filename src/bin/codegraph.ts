@@ -2110,6 +2110,235 @@ program
     }
   });
 
+// ===========================================================================
+// Deterministic trace commands: who-drives / who-reads / instances
+//
+// `callers` above ranks: it goes through `searchNodes` (FTS), keeps a `limit`,
+// and can therefore drop the row that mattered. These three do not rank at
+// all — exact name lookup, then every incident edge, in source order. They
+// exist because a verification engineer tracing a net needs the COMPLETE set
+// or an explicit refusal, never a plausible top-N. See src/trace.ts.
+// ===========================================================================
+
+/** Exit code for "the resolved index cannot answer this" — distinct from 1. */
+const EXIT_CAPABILITY_GAP = 2;
+
+/**
+ * Other indexed roots reachable from `root`: every indexed ancestor, plus the
+ * indexed sub-projects below it. Used only to make a capability gap
+ * actionable — it names the index that DOES hold the missing edges instead of
+ * telling the caller to go looking.
+ */
+function reachableIndexRoots(root: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>([path.resolve(root)]);
+  let current = path.dirname(path.resolve(root));
+  const fsRoot = path.parse(current).root;
+  for (;;) {
+    if (!seen.has(current) && isInitialized(current)) {
+      seen.add(current);
+      out.push(current);
+    }
+    if (current === fsRoot) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { findIndexedSubprojectRoots } = require('../directory') as typeof import('../directory');
+    for (const sub of findIndexedSubprojectRoots(path.resolve(root))) {
+      if (!seen.has(sub)) { seen.add(sub); out.push(sub); }
+    }
+    // Siblings under an indexed-or-not parent: a project whose RTL index sits
+    // beside a parent-directory index rather than under it.
+    const parent = path.dirname(path.resolve(root));
+    for (const sub of findIndexedSubprojectRoots(parent)) {
+      if (!seen.has(sub)) { seen.add(sub); out.push(sub); }
+    }
+  } catch { /* down-scan is best-effort; the ancestors above already help */ }
+  return out;
+}
+
+/**
+ * Census every reachable alternative index. Opens each read-only and closes
+ * it immediately — only ever called on the gap path, so the cost is paid
+ * exactly when the caller is already blocked.
+ */
+async function censusReachable(root: string): Promise<import('../index-capability').IndexCapability[]> {
+  const { default: CodeGraph } = await loadCodeGraph();
+  const { capabilityOf } = await import('../index-capability');
+  const out: import('../index-capability').IndexCapability[] = [];
+  for (const alt of reachableIndexRoots(root)) {
+    try {
+      const other = await CodeGraph.open(alt);
+      try { out.push(capabilityOf(other)); } finally { other.destroy(); }
+    } catch { /* an index we cannot open is not an alternative worth naming */ }
+  }
+  return out;
+}
+
+/**
+ * Render a trace result. The two properties that matter:
+ *   - every site is printed with `file:line` of the STATEMENT, not of a
+ *     declaration, so the output is a debugger's work list;
+ *   - zero sites prints the absence PROOF, naming how many edges were
+ *     examined to establish it. Printing nothing would be indistinguishable
+ *     from a tool that failed.
+ */
+function renderTrace(
+  result: import('../trace').TraceResult,
+  siteCount: number,
+  json: boolean,
+): void {
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  const heading = {
+    drivers: `Drivers of "${result.subject}"`,
+    readers: `Readers of "${result.subject}"`,
+    instances: `Instantiations of "${result.subject}"`,
+  }[result.question];
+
+  if (result.matches.length === 0) {
+    console.log(chalk.bold(`\n${heading}: NAME NOT INDEXED\n`));
+    console.log(`  No node is named exactly "${result.subject}" in this index.`);
+    if (result.nearMisses.length > 0) {
+      console.log(`  Indexed names containing it:`);
+      for (const n of result.nearMisses) {
+        console.log(chalk.dim(`    ${n.name}  (${n.kind})  ${n.filePath}:${n.startLine}`));
+      }
+    } else {
+      console.log(chalk.dim(`  No indexed name contains that string either.`));
+    }
+    console.log();
+    return;
+  }
+
+  console.log(chalk.bold(`\n${heading} (${siteCount}):\n`));
+  for (const match of result.matches) {
+    console.log(
+      chalk.cyan(match.node.kind.padEnd(12)) +
+      chalk.white(match.node.name) +
+      chalk.dim(`  declared ${match.node.filePath}:${match.node.startLine}`),
+    );
+    if (match.sites.length === 0) {
+      console.log(
+        chalk.dim(
+          `    0 results — absence proven against ${result.edgesConsulted} ` +
+          `${result.kindsConsulted.join('/')} edges in this index`,
+        ),
+      );
+    }
+    for (const site of match.sites) {
+      const loc = site.line === null ? site.filePath : `${site.filePath}:${site.line}`;
+      const detail = site.detail ? ` ${site.detail}` : '';
+      const flag = site.ambiguous ? chalk.yellow('  [direction not distinguished]') : '';
+      console.log(`    ${chalk.dim(`(${site.via}${detail})`)} ${site.peer} — ${loc}${flag}`);
+    }
+    console.log();
+  }
+
+  if (siteCount === 0) {
+    console.log(
+      chalk.dim(
+        `Absence is the answer: ${result.edgesConsulted} ${result.kindsConsulted.join('/')} ` +
+        `edges exist in this index and none is incident to "${result.subject}".\n`,
+      ),
+    );
+  }
+}
+
+/**
+ * Shared body for the three trace commands: open, gate on capability, run the
+ * ranking-free query, render.
+ */
+async function runTrace(
+  question: 'drivers' | 'readers' | 'instances',
+  symbol: string,
+  options: { path?: string; json?: boolean },
+): Promise<void> {
+  const projectPath = resolveProjectPath(options.path);
+
+  if (!isInitialized(projectPath)) {
+    error(`CodeGraph not initialized in ${projectPath}`);
+    process.exit(1);
+  }
+
+  const { default: CodeGraph } = await loadCodeGraph();
+  const { capabilityOf, capabilityGap, capabilityGapMessage, TRACE_EDGE_KINDS } =
+    await import('../index-capability');
+  const trace = await import('../trace');
+  const cg = await CodeGraph.open(projectPath);
+
+  try {
+    // The by-construction guard. An index holding zero edges of the kind this
+    // question is decided by cannot answer it — say so, name the index that
+    // can, and exit non-zero. Answering anyway is exactly the
+    // wrong-index failure.
+    const gap = capabilityGap(capabilityOf(cg), TRACE_EDGE_KINDS[question]);
+    if (gap) {
+      const alternatives = await censusReachable(cg.getProjectRoot());
+      error(capabilityGapMessage(gap, { subject: symbol, alternatives, retargetAs: '--path' }));
+      cg.destroy();
+      process.exit(EXIT_CAPABILITY_GAP);
+    }
+
+    const result =
+      question === 'drivers' ? trace.whoDrives(cg, symbol)
+      : question === 'readers' ? trace.whoReads(cg, symbol)
+      : trace.instancesOf(cg, symbol);
+
+    renderTrace(result, trace.siteCount(result), !!options.json);
+  } finally {
+    cg.destroy();
+  }
+}
+
+program
+  .command('who-drives <net>')
+  .description('Every driver of a net/signal — assignments plus inbound port hookups, ranking-free')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (net: string, options: { path?: string; json?: boolean }) => {
+    try {
+      await runTrace('drivers', net, options);
+    } catch (err) {
+      error(`who-drives failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('who-reads <net>')
+  .description('Every reader of a net/signal — every read line plus outbound port hookups, ranking-free')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (net: string, options: { path?: string; json?: boolean }) => {
+    try {
+      await runTrace('readers', net, options);
+    } catch (err) {
+      error(`who-reads failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('instances <module>')
+  .description('Every instantiation site of a module — proves absence when there is none, ranking-free')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (moduleName: string, options: { path?: string; json?: boolean }) => {
+    try {
+      await runTrace('instances', moduleName, options);
+    } catch (err) {
+      error(`instances failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
 /**
  * codegraph callees <symbol>
  */
