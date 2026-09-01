@@ -39,6 +39,12 @@ does not index those (an identifier that dies at its block's end is neither
 probeable, connectable nor driveable), so the two are reported separately and
 the caller must never fold them together.
 
+Every name is filed under the file whose TEXT declares it, resolved through
+slang's SourceManager -- NOT under the file being parsed when it was found. An
+`include`-d header's declarations therefore belong to the header, matching how
+the index attributes them. A declaration whose origin file was not in `files`
+is reported nowhere and counted in `notes`.
+
 Exit codes: 0 on success, 2 when pyslang is not importable (the caller degrades
 to a printed skip), 3 on a malformed job.
 """
@@ -148,9 +154,91 @@ def main():
             % (version, len(defines))
         )
 
-    out_files = {}
+    # -- Origin routing --------------------------------------------------------
+    #
+    # A declaration belongs to the file whose TEXT declares it, never to
+    # whichever file happened to pull it in.
+    #
+    # In preprocessed mode -- the configuration this pass itself recommends --
+    # slang splices an `include`-d header into the including file's token
+    # stream, so every name a header declared was reported as the INCLUDER's.
+    # The index attributes those names to the header, correctly, and the two
+    # then disagreed on every one of them: a correct index failed --strict with
+    # one MISSING per included declaration, which in practice means teams turn
+    # the gate off. slang knew the answer all along -- each token carries a
+    # SourceLocation whose buffer IS the origin file -- it was simply never
+    # asked.
+    #
+    # This is NOT preprocessed-only. A relative `include` resolves against the
+    # including file's own directory even with no user directories configured,
+    # so syntax-only mode misattributes exactly the same way; it is routed
+    # through the tree's own SourceManager rather than being left alone.
+    FOREIGN = object()
+
+    requested_by_path = {}
+    for rel in files:
+        try:
+            key = os.path.normcase(os.path.realpath(os.path.join(root, rel.replace("/", os.sep))))
+        except Exception:  # noqa: BLE001
+            continue
+        requested_by_path[key] = rel
+
+    path_cache = {}
+
+    def origin_of(sm, loc):
+        """Requested rel owning this declaration, FOREIGN, or None if unresolved.
+
+        None means asking slang did not work, and the caller then keeps the
+        pre-routing behaviour of crediting the file being parsed. Dropping the
+        name instead would shrink the graded population silently while the score
+        still read 100% -- the exact false-green this pass exists to prevent.
+        """
+        if sm is None:
+            return None
+        try:
+            if sm.isMacroLoc(loc):
+                # A macro-generated declaration belongs where the macro was
+                # USED: that is the file a reader opens to find it.
+                loc = sm.getFullyExpandedLoc(loc)
+        except Exception:  # noqa: BLE001
+            pass
+        raw = None
+        try:
+            raw = str(sm.getFullPath(loc.buffer))
+        except Exception:  # noqa: BLE001
+            raw = None
+        if not raw or raw == ".":
+            # getFullPath has no buffer for some synthesized locations; the
+            # printable name is cwd-relative but still resolvable.
+            try:
+                raw = sm.getFileName(loc)
+            except Exception:  # noqa: BLE001
+                return None
+        if not raw:
+            return None
+        hit = path_cache.get(raw, 0)
+        if hit == 0:
+            try:
+                hit = requested_by_path.get(os.path.normcase(os.path.realpath(raw)), FOREIGN)
+            except Exception:  # noqa: BLE001
+                hit = None
+            path_cache[raw] = hit
+        return hit
+
+    # rel -> {"scope": set, "local": set}. Accumulated ACROSS parses: a header's
+    # names are discovered while parsing whatever includes it, and again when
+    # the header is parsed in its own right.
+    buckets = {}
     parse_failed = []
     not_on_disk = []
+    foreign_dropped = 0
+
+    def bucket_in(store, rel):
+        b = store.get(rel)
+        if b is None:
+            b = {"scope": set(), "local": set()}
+            store[rel] = b
+        return b
 
     for rel in files:
         abspath = os.path.join(root, rel.replace("/", os.sep))
@@ -169,8 +257,14 @@ def main():
             parse_failed.append(rel)
             continue
 
-        scope = set()
-        local = set()
+        # Syntax-only mode still processes relative includes, so it still needs
+        # a manager to route them; the tree carries the one it used.
+        tree_sm = source_manager if source_manager is not None else getattr(tree, "sourceManager", None)
+
+        # Staged per parse and merged only on success, so a walk that throws
+        # partway leaves the report exactly as a failed parse always did.
+        pending = {}
+        pending_foreign = [0]
 
         def is_local(node, skip_own_declaration=False):
             parent = getattr(node, "parent", None)
@@ -197,15 +291,26 @@ def main():
             text = str(raw).strip()
             return text or None
 
-        def visit(node, _s=scope, _l=local):
+        def visit(node, _rel=rel, _sm=tree_sm, _p=pending, _pf=pending_foreign):
             kind = str(getattr(node, "kind", ""))
-            if kind in DECL_KINDS or kind in HEADER_KINDS:
-                name = name_of(node)
-                if name:
-                    if is_local(node, skip_own_declaration=(kind == PROTOTYPE_KIND)):
-                        _l.add(name)
-                    else:
-                        _s.add(name)
+            if kind not in DECL_KINDS and kind not in HEADER_KINDS:
+                return
+            name = name_of(node)
+            if not name:
+                return
+            try:
+                owner = origin_of(_sm, node.sourceRange.start)
+            except Exception:  # noqa: BLE001
+                owner = None
+            if owner is FOREIGN:
+                # Declared in a file outside the graded set -- an unscoped or
+                # unindexed header. Not this file's name, and not one this run
+                # was asked to grade.
+                _pf[0] += 1
+                return
+            target = _rel if owner is None else owner
+            key = "local" if is_local(node, skip_own_declaration=(kind == PROTOTYPE_KIND)) else "scope"
+            bucket_in(_p, target)[key].add(name)
 
         try:
             tree.root.visit(visit)
@@ -213,7 +318,24 @@ def main():
             parse_failed.append(rel)
             continue
 
-        out_files[rel] = {"scope": sorted(scope), "local": sorted(local)}
+        for target, b in pending.items():
+            dest = bucket_in(buckets, target)
+            dest["scope"] |= b["scope"]
+            dest["local"] |= b["local"]
+        foreign_dropped += pending_foreign[0]
+        # A file that parsed cleanly and declares nothing still reports, exactly
+        # as it did before routing existed.
+        bucket_in(buckets, rel)
+
+    out_files = {
+        rel: {"scope": sorted(b["scope"]), "local": sorted(b["local"])}
+        for rel, b in buckets.items()
+    }
+    if foreign_dropped:
+        notes.append(
+            "%d declaration(s) are declared in files outside the graded set (unscoped or "
+            "unindexed headers) and were attributed to no graded file" % foreign_dropped
+        )
 
     json.dump(
         {

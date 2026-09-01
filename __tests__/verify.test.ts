@@ -29,6 +29,7 @@ import {
   type IndexedFile,
 } from '../src/verify';
 import { clearProjectConfigCache, loadVerifyConfig } from '../src/project-config';
+import { CodeGraph } from '../src';
 
 describe('verify — conditional-region mapper', () => {
   it('covers an `ifdef block from its directive to its `endif, inclusive', () => {
@@ -752,4 +753,113 @@ describe('verify — oracle protocol', () => {
     const source = fs.readFileSync(script!, 'utf8');
     expect(source).toContain(`PROTOCOL = ${ORACLE_PROTOCOL}`);
   });
+});
+
+/**
+ * End-to-end against the REAL oracle. Everything above this point is a unit
+ * test over a hand-written report, which is exactly why the `` `include ``
+ * misattribution survived a full suite: no test ever asked the compiler
+ * front-end which file a name came from.
+ *
+ * Gated on pyslang being importable so a machine without it reports SKIPPED
+ * rather than a green it did not earn.
+ */
+const ORACLE_AVAILABLE = (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-oracle-probe-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'p.sv'), 'module p; wire a; endmodule\n');
+    return (
+      runGrader({
+        root: dir,
+        files: ['p.sv'],
+        includeDirs: [],
+        defines: {},
+        timeoutMs: 60_000,
+      }).status === 'ok'
+    );
+  } catch {
+    return false;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
+describe('verify — `include attribution (the origin file owns the name)', () => {
+  let tempDir: string;
+
+  afterEach(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  /** rtl/user.sv `include`s rtl/include/defs.svh, with includeDirs configured. */
+  function fixture(): string {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-verify-include-'));
+    fs.mkdirSync(path.join(tempDir, 'rtl', 'include'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'rtl', 'include', 'defs.svh'),
+      'parameter INCLUDED_PARAM = 4;\nwire included_sig;\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'rtl', 'user.sv'),
+      'module user;\n`include "defs.svh"\n  wire own_sig;\nendmodule\n'
+    );
+    return tempDir;
+  }
+
+  it.runIf(ORACLE_AVAILABLE)(
+    'keys an `include-d declaration to the header, not to the including file',
+    () => {
+      const root = fixture();
+      const outcome = runGrader({
+        root,
+        files: ['rtl/user.sv', 'rtl/include/defs.svh'],
+        includeDirs: ['rtl/include'],
+        defines: {},
+        timeoutMs: 60_000,
+      });
+      expect(outcome.status).toBe('ok');
+      if (outcome.status !== 'ok') return;
+
+      // The including file owns only what its OWN text declares.
+      expect(outcome.report.files['rtl/user.sv']?.scope.slice().sort()).toEqual([
+        'own_sig',
+        'user',
+      ]);
+      // The header owns the names its own text declares.
+      expect(outcome.report.files['rtl/include/defs.svh']?.scope.slice().sort()).toEqual([
+        'INCLUDED_PARAM',
+        'included_sig',
+      ]);
+    }
+  );
+
+  it.runIf(ORACLE_AVAILABLE)(
+    'reports no MISSING for a correct index whose headers declare names',
+    async () => {
+      const root = fixture();
+      fs.writeFileSync(
+        path.join(root, 'codegraph.json'),
+        JSON.stringify({ verify: { includeDirs: ['rtl/include'] } })
+      );
+      clearProjectConfigCache();
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        const outcome = cg.verify({ timeoutMs: 60_000 });
+        expect(outcome.status).toBe('ok');
+        if (outcome.status !== 'ok') return;
+
+        const missing = outcome.result.files
+          .flatMap((f) => f.disagreements)
+          .filter((d) => d.verdict === 'MISSING')
+          .map((d) => `${d.file} ${d.name}`)
+          .sort();
+        expect(missing).toEqual([]);
+        expect(verifyExitCode(outcome, true)).toBe(0);
+      } finally {
+        cg.destroy();
+      }
+    }
+  );
 });
