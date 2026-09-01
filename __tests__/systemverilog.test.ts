@@ -2543,3 +2543,241 @@ endmodule
     expect(driversOf(cg, 'rstn', 'tb.sv')).toEqual([]);
   });
 });
+
+describe('SystemVerilog subroutine-body dataflow (reads and drives inside function/task bodies)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    if (cg) {
+      cg.destroy();
+      cg = undefined;
+    } else if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function indexFiles(files: Record<string, string>): Promise<CodeGraph> {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sv-subr-'));
+    for (const [name, body] of Object.entries(files)) {
+      fs.writeFileSync(path.join(tempDir, name), body);
+    }
+    const graph = await CodeGraph.init(tempDir, { index: true });
+    graph.resolveReferences();
+    return graph;
+  }
+
+  function signal(graph: CodeGraph, name: string, file: string): Node {
+    const node = graph
+      .getNodesByKind('field')
+      .find((n) => n.name === name && n.filePath === file);
+    expect(node, `signal ${name} in ${file}`).toBeDefined();
+    return node!;
+  }
+
+  /** `<writerQName>@L<line>` for every drives edge into the named signal. */
+  function driversOf(graph: CodeGraph, name: string, file: string): string[] {
+    return graph
+      .getIncomingEdges(signal(graph, name, file).id)
+      .filter((e) => e.kind === 'drives')
+      .map((e) => `${graph.getNode(e.source)?.qualifiedName ?? e.source}@L${e.line}`)
+      .sort();
+  }
+
+  /** `<readerQName>@[lines]` for every reads edge into the named signal. */
+  function readersOf(graph: CodeGraph, name: string, file: string): string[] {
+    return graph
+      .getIncomingEdges(signal(graph, name, file).id)
+      .filter((e) => e.kind === 'reads')
+      .map((e) => {
+        const lines = (e.metadata as { lines?: number[] } | undefined)?.lines ?? [];
+        return `${graph.getNode(e.source)?.qualifiedName ?? e.source}@[${lines.join(',')}]`;
+      })
+      .sort();
+  }
+
+  // One module whose ENTIRE dataflow lives inside a task and a function — the
+  // shape of the behavioral bus models this feature exists for.
+  const MODEL = `
+module i2c_model(input clk, output reg sda, output reg scl);
+  reg [7:0] cfg_word;
+  reg [7:0] shadow_me;
+  integer   beat;
+
+  task automatic drive_byte(input [7:0] arg);
+    reg [7:0] shadow_me;
+    begin
+      shadow_me = arg;
+      sda  = cfg_word[0];
+      scl  = 1'b1;
+      beat = beat + 1;
+    end
+  endtask
+
+  function [7:0] next_cfg(input [7:0] v);
+    next_cfg = v ^ cfg_word;
+  endfunction
+endmodule
+`;
+
+  it('binds a drive made inside a task body to the module-level signal', async () => {
+    cg = await indexFiles({ 'i2c_model.v': MODEL });
+    // sda and scl are written ONLY from inside drive_byte. Before the
+    // subroutine walker invoked the language hook these were empty: the
+    // module's whole driver answer was silence.
+    expect(driversOf(cg!, 'sda', 'i2c_model.v')).toEqual(['i2c_model::drive_byte@L11']);
+    expect(driversOf(cg!, 'scl', 'i2c_model.v')).toEqual(['i2c_model::drive_byte@L12']);
+    expect(driversOf(cg!, 'beat', 'i2c_model.v')).toEqual(['i2c_model::drive_byte@L13']);
+  });
+
+  it('binds a read made inside a task or function body to the module-level signal', async () => {
+    cg = await indexFiles({ 'i2c_model.v': MODEL });
+    expect(readersOf(cg!, 'cfg_word', 'i2c_model.v')).toEqual([
+      'i2c_model::drive_byte@[11]',
+      'i2c_model::next_cfg@[18]',
+    ]);
+    // `beat = beat + 1` reads beat as well as driving it.
+    expect(readersOf(cg!, 'beat', 'i2c_model.v')).toEqual(['i2c_model::drive_byte@[13]']);
+  });
+
+  it('never lets a subroutine-local declaration bind to the module signal it shadows', async () => {
+    // The subtly-wrong version of this fix: retry the lookup one hop up
+    // unconditionally, and `shadow_me = arg` inside the task — a write to the
+    // task's OWN reg — is reported as a write to the module's shadow_me. That
+    // is a confident wrong driver answer, which this branch rates worse than a
+    // missing one.
+    cg = await indexFiles({ 'i2c_model.v': MODEL });
+    expect(driversOf(cg!, 'shadow_me', 'i2c_model.v')).toEqual([]);
+    // The task's formal argument is not a module signal either.
+    expect(cg!.getNodesByKind('field').filter((n) => n.name === 'arg')).toEqual([]);
+  });
+
+  it('leaves procedural locals unindexed: the shadowing declaration creates no node', async () => {
+    cg = await indexFiles({ 'i2c_model.v': MODEL });
+    // Exactly ONE shadow_me node — the module's. The task's local declaration
+    // must not become a second field node.
+    expect(
+      cg!.getNodesByKind('field').filter((n) => n.name === 'shadow_me').length
+    ).toBe(1);
+  });
+
+  it('resolves a hierarchical backdoor write made inside a task body', async () => {
+    // A UVM-style reset task: a dotted write inside a task
+    // produced zero hier_ref and zero drives edges.
+    cg = await indexFiles({
+      'leaf.v': `
+module leaf(input clk, output reg [7:0] state);
+  always @(posedge clk) state <= state + 1;
+endmodule
+`,
+      'core.v': `
+module core(input clk);
+  leaf u_leaf(.clk(clk));
+endmodule
+`,
+      'top_dut.v': `
+module top_dut(input clk);
+  core u_core(.clk(clk));
+endmodule
+`,
+      'tb.sv': `
+module tb;
+  reg clk;
+  task automatic reset_dut();
+    begin
+      top_dut.u_core.u_leaf.state = 8'h0;
+    end
+  endtask
+endmodule
+`,
+    });
+    const task = cg!.getNodesByKind('function').find((n) => n.name === 'reset_dut');
+    expect(task, 'reset_dut task node').toBeDefined();
+    const paths = cg!
+      .getOutgoingEdges(task!.id)
+      .filter((e) => e.kind === 'hier_ref' || (e.kind === 'drives' && (e.metadata as { path?: string })?.path))
+      .map((e) => {
+        const m = (e.metadata ?? {}) as { path?: string; partial?: boolean; unresolvedTail?: string };
+        return `${e.kind} ${m.path} -> ${cg!.getNode(e.target)?.qualifiedName ?? e.target}${m.partial ? ` PARTIAL:${m.unresolvedTail}` : ''}`;
+      })
+      .sort();
+    // An lvalue path that resolves end to end is backdoor stimulus — a real
+    // write — so it reaches the driver answer as `drives`.
+    expect(paths).toEqual(['drives top_dut.u_core.u_leaf.state -> leaf::state']);
+  });
+
+  it('does not let a subroutine-local struct handle fabricate a cross-module path', async () => {
+    // Rule 1 of the hierarchical root walk drops `bus.valid` as a member select
+    // when `bus` is visible in the emitting scope. A subroutine local is
+    // deliberately unindexed, so it is invisible to that rule — and a module
+    // named `bus` elsewhere in the design would capture the root.
+    cg = await indexFiles({
+      'bus.v': `
+module bus(input clk, output reg valid);
+  always @(posedge clk) valid <= 1'b1;
+endmodule
+`,
+      'tb.sv': `
+module tb;
+  typedef struct packed { logic valid; } bus_t;
+  task automatic poke();
+    bus_t bus;
+    begin
+      bus.valid = 1'b1;
+    end
+  endtask
+endmodule
+`,
+    });
+    // Module bus drives its own valid — that edge is real and stays. The
+    // invariant is that NOTHING from tb joins it.
+    expect(driversOf(cg!, 'valid', 'bus.v')).toEqual(['bus@L3']);
+  });
+
+  it('rebuilds subroutine-body dataflow after an incremental sync (sync == full index)', async () => {
+    // The fix changes WHAT the graph holds, so it must hold the same thing on
+    // both paths. `[spec 2]` is the precedent: editing an SV file once erased
+    // every post-pass edge in it until a full re-index put them back, which
+    // scoped the whole feature to full index without saying so.
+    cg = await indexFiles({ 'i2c_model.v': MODEL });
+    const before = [
+      ...driversOf(cg!, 'sda', 'i2c_model.v'),
+      ...driversOf(cg!, 'scl', 'i2c_model.v'),
+      ...readersOf(cg!, 'cfg_word', 'i2c_model.v'),
+    ];
+    expect(before.length).toBe(4);
+
+    // A comment-only edit that INSERTS a line: same dataflow, every site one
+    // line lower. The shift is the point — an assertion over unmoved line
+    // numbers passes just as happily on a stale edge left behind as on a
+    // correctly rebuilt one.
+    fs.writeFileSync(path.join(tempDir, 'i2c_model.v'), `\n// touched${MODEL}`);
+    await cg!.sync();
+
+    expect([
+      ...driversOf(cg!, 'sda', 'i2c_model.v'),
+      ...driversOf(cg!, 'scl', 'i2c_model.v'),
+      ...readersOf(cg!, 'cfg_word', 'i2c_model.v'),
+    ]).toEqual(
+      before.map((s) =>
+        s
+          .replace(/@L(\d+)$/, (_, n) => `@L${Number(n) + 1}`)
+          .replace(/@\[([\d,]+)\]$/, (_, ns: string) => `@[${ns.split(',').map((n) => Number(n) + 1).join(',')}]`)
+      )
+    );
+  });
+
+  it('leaves no subroutine-body marker unresolved after indexing', async () => {
+    cg = await indexFiles({ 'i2c_model.v': MODEL });
+    const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    let left: { reference_name: string }[];
+    try {
+      left = db.getDb().prepare(
+        `SELECT reference_name FROM unresolved_refs WHERE reference_name LIKE '__sv_drive__%' OR reference_name LIKE '__sv_read__%' OR reference_name LIKE '__sv_hier__%'`
+      ).all() as { reference_name: string }[];
+    } finally {
+      db.close();
+    }
+    expect(left).toEqual([]);
+  });
+});

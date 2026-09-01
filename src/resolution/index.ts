@@ -1688,6 +1688,35 @@ export class ReferenceResolver {
     return names;
   }
 
+  /**
+   * The scope a marker emitted from a SUBROUTINE should fall back to: the
+   * module (or class, or interface) that `contains` it.
+   *
+   * Every SV marker pass binds against the scope that emitted it, which was
+   * exactly right while markers only came from module scope. Reads and drives
+   * inside a `function`/`task` body are emitted from the SUBROUTINE node, and a
+   * subroutine contains no signals -- SystemVerilog scoping says the names it
+   * writes and reads are its enclosing module's. So a miss at subroutine scope
+   * retries one `contains` hop up, and only one: the enclosing module is where
+   * the LRM stops, and walking further would reach the file and start binding
+   * across modules, which is the class of fabricated edge this module refuses
+   * to make.
+   *
+   * Returns undefined for anything that is not a subroutine, so a module-scope
+   * marker keeps its single-scope behaviour unchanged.
+   */
+  private svParentScopeOf(nodeId: string): string | undefined {
+    const from = this.queries.getNodeById(nodeId);
+    if (!from || (from.kind !== 'function' && from.kind !== 'method')) return undefined;
+    for (const e of this.queries.getIncomingEdges(nodeId, ['contains'])) {
+      const parent = this.queries.getNodeById(e.source);
+      // A subroutine parented by the FILE node has no enclosing module (an
+      // include fragment); there is nothing to bind against, so stay put.
+      if (parent && parent.kind !== 'file') return parent.id;
+    }
+    return undefined;
+  }
+
   private buildMemberMap(
     scopeId: string,
     cache: Map<string, Map<string, string>>,
@@ -1760,7 +1789,20 @@ export class ReferenceResolver {
         skipDecorator: ReferenceResolver.SV_MACRO_DECORATOR,
       });
 
-      const target = members.get(ref.referenceName.slice(PREFIX.length));
+      const name = ref.referenceName.slice(PREFIX.length);
+      // A write inside a task/function body names the enclosing module's
+      // signal; see svParentScopeOf. The extractor has already dropped any name
+      // the subroutine declares itself, so this retry cannot bind a local to
+      // the module signal it shadows.
+      let target = members.get(name);
+      if (!target) {
+        const parent = this.svParentScopeOf(ref.fromNodeId);
+        if (parent) {
+          target = this.buildMemberMap(parent, membersByScope, {
+            skipDecorator: ReferenceResolver.SV_MACRO_DECORATOR,
+          }).get(name);
+        }
+      }
       if (!target) continue; // implicit net or cross-module hierarchical write
       edges.push({
         source: ref.fromNodeId,
@@ -1921,7 +1963,18 @@ export class ReferenceResolver {
       const members = this.buildMemberMap(ref.fromNodeId, membersByScope, {
         skipDecorator: ReferenceResolver.SV_MACRO_DECORATOR,
       });
-      const target = members.get(ref.referenceName.slice(PREFIX.length));
+      const name = ref.referenceName.slice(PREFIX.length);
+      // Same one-hop retry as the drive pass: a read inside a subroutine body
+      // is a read of the enclosing module's signal.
+      let target = members.get(name);
+      if (!target) {
+        const parent = this.svParentScopeOf(ref.fromNodeId);
+        if (parent) {
+          target = this.buildMemberMap(parent, membersByScope, {
+            skipDecorator: ReferenceResolver.SV_MACRO_DECORATOR,
+          }).get(name);
+        }
+      }
       if (!target) continue; // implicit net or out-of-scope name
 
       const key = `${ref.fromNodeId}|${target}`;
@@ -2082,24 +2135,41 @@ export class ReferenceResolver {
       // --- root: innermost scope outwards, never the global table first ------
       const root = segments[0]!;
 
+      // Rules 1-3 below all ask questions about a MODULE — which instances it
+      // declares, what its own name is. A path written inside a `task`/
+      // `function` body is emitted from the SUBROUTINE, which declares no
+      // instances and is not the module, so every rule missed and the marker
+      // fell through to rule 4's global name lookup — the one rule that can
+      // reach outside the design. The scope walk retries one `contains` hop up,
+      // exactly as the drive and read passes do.
+      const scopeId = this.svParentScopeOf(ref.fromNodeId) ?? ref.fromNodeId;
+
       // 1. A declaration VISIBLE to the emitting scope. `bus.valid` on a local
       //    `bus_t bus` is a member select, not a hierarchical path — drop it.
       //    Binding it would fabricate a cross-module driver out of a plain local
       //    write. "Visible" is the scope's own members, everything declared in
       //    the same file, and the members of whatever it imports; see
       //    buildVisibleSubjectNames for why each source is needed.
-      if (this.buildVisibleSubjectNames(ref.fromNodeId, visibleByScope).has(root)) continue;
+      //    (A subroutine-LOCAL subject never reaches here: it has no node to be
+      //    visible, so the extractor drops that shape at the declaration.)
+      if (
+        this.buildVisibleSubjectNames(ref.fromNodeId, visibleByScope).has(root) ||
+        (scopeId !== ref.fromNodeId &&
+          this.buildVisibleSubjectNames(scopeId, visibleByScope).has(root))
+      ) {
+        continue;
+      }
 
       // 2. An instance declared in the emitting scope — a relative path.
       let current: string | undefined = this.buildInstanceMap(
-        ref.fromNodeId,
+        scopeId,
         instancesByModule
       ).get(root);
 
       // 3. The emitting module itself — the absolute-probe idiom, resolved
       //    WITHOUT a global name lookup so it cannot leave its own design.
       if (!current) {
-        const from = this.queries.getNodeById(ref.fromNodeId);
+        const from = this.queries.getNodeById(scopeId);
         if (from && from.kind === 'module' && from.name === root) current = from.id;
       }
 
@@ -2110,7 +2180,7 @@ export class ReferenceResolver {
       //     same-named module fabricates the edge. The path cannot be followed
       //     (there is nothing to follow it into), so this is a DROP, not a bind:
       //     silent beats wrong.
-      if (!current && this.svInstanceLabels.get(ref.fromNodeId)?.has(root)) continue;
+      if (!current && this.svInstanceLabels.get(scopeId)?.has(root)) continue;
 
       // 4. The elaboration top, by name — but only when the name identifies ONE
       //    module in this language AND names no declaration anywhere in it.

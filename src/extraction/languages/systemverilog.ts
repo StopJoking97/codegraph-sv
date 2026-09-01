@@ -525,9 +525,12 @@ function emitDriveMarkers(lvalue: SyntaxNode, site: SyntaxNode, ctx: ExtractorCo
   if (ids.length === 0) return;
   const line = site.startPosition.row + 1;
   const column = site.startPosition.column;
+  // Empty outside a subroutine body. A write to a task's own local must not
+  // reach the module signal it shadows -- see the subroutine-body block.
+  const locals = subroutineLocals(site, ctx);
   for (const id of ids) {
     const name = getNodeText(id, ctx.source).trim();
-    if (!name) continue;
+    if (!name || locals?.has(name)) continue;
     ctx.addUnresolvedReference({
       fromNodeId: fromId,
       referenceName: `${SV_DRIVE_PREFIX}${name}`,
@@ -888,6 +891,142 @@ export function clearPendingDirectiveMacros(): void {
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
 
+// -- Subroutine bodies: the dataflow inside a task or function ----------------
+//
+// A `function`/`task` body is walked by the engine's BODY walker, not the
+// declaration walker, and the body walker calls this hook too (gated to this
+// language). Everything below exists to make that second entry point safe.
+//
+// Two rules, and each one is load-bearing:
+//
+//   1. Inside a body the hook may emit REFERENCES and must never create a NODE.
+//      Procedural locals are unindexed engine-wide, and a body walk is nothing
+//      but procedural statements -- so the branches that create signal,
+//      parameter, enum and import nodes are unreachable from here by
+//      construction rather than by each branch remembering to check.
+//   2. A name a subroutine DECLARES is not the module signal it shadows.
+//      Because rule 1 leaves that local out of the graph, the module-scope
+//      retry in the resolver would happily bind `shadow_me = arg` inside a task
+//      to the module's own `shadow_me` -- a confident wrong driver, which is
+//      the failure mode this whole feature set is built to avoid. The local
+//      NAMES are therefore collected from the AST (never indexed) and used to
+//      suppress the marker at its source.
+//
+// Rule 2 also stands in for the resolver's member-select rule on hierarchical
+// paths: `bus.valid = 1'b1` on a subroutine-local `bus_t bus` must not become a
+// cross-module drive just because some other file declares `module bus`. The
+// resolver drops that shape when the root is VISIBLE in the emitting scope, and
+// an unindexed local is visible nowhere -- so the drop has to happen here,
+// where the declaration is still in front of us.
+
+/** Node types the hook may act on while the BODY walker is driving it. */
+const SV_SUBROUTINE_BODY_NODES: ReadonlySet<string> = new Set([
+  'hierarchical_identifier', // reads, and hierarchical (dotted) paths
+  'blocking_assignment', // x = y;
+  'nonblocking_assignment', // x <= y;
+  'text_macro_usage', // `MACRO in procedural code
+]);
+
+/** Declaration shapes whose declarator names a subroutine-scoped LOCAL. */
+const SV_LOCAL_DECL_NODES: ReadonlySet<string> = new Set([
+  'variable_decl_assignment', // reg [7:0] tmp;
+  'net_decl_assignment', // wire w;
+  'param_assignment', // localparam N = 4;
+  'tf_port_item', // the formal argument list
+  'for_variable_declaration', // for (int i = 0; ...)
+]);
+
+/** Body roots: what `resolveBody` hands the engine for each subroutine shape. */
+const SV_SUBROUTINE_BODY_ROOTS = /(?:_body_declaration|^class_constructor_declaration)$/;
+
+/**
+ * Local names per subroutine body, keyed `<filePath>|<body.startIndex>`.
+ *
+ * Cleared whenever the walk reaches a `source_file`, which is the first node of
+ * every file's walk -- so a stale entry cannot outlive the file that made it.
+ */
+const svLocalNamesByBody = new Map<string, Set<string>>();
+
+/** The enclosing subroutine body, or undefined if this node is not inside one. */
+function enclosingSubroutineBody(node: SyntaxNode): SyntaxNode | undefined {
+  for (let p = node.parent, depth = 0; p && depth < 128; p = p.parent, depth++) {
+    if (SV_SUBROUTINE_BODY_ROOTS.test(p.type)) return p;
+    // A subroutine body never spans one of these, so stop rather than walk the
+    // whole file on every identifier in module scope.
+    if (MODULE_NODES.has(p.type) || p.type === 'class_declaration' || p.type === 'package_declaration') {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Every name declared INSIDE this subroutine body, plus the subroutine's own
+ * name -- a function's name is its return variable, so `pick = v` writes a
+ * local, not a module signal.
+ *
+ * Over-collection is the safe direction here: a name wrongly treated as local
+ * costs one missing edge, while a local wrongly treated as a module signal
+ * invents a driver. Locals of a nested named subroutine are therefore folded in
+ * rather than separated.
+ */
+function collectSubroutineLocals(body: SyntaxNode, source: string): Set<string> {
+  const names = new Set<string>();
+
+  // The subroutine's own name: the first direct simple_identifier child of the
+  // body node (`task_body_declaration > simple_identifier` -- the return type,
+  // when present, is its own node).
+  for (let i = 0; i < body.namedChildCount; i++) {
+    const c = body.namedChild(i);
+    if (c?.type === 'simple_identifier') {
+      const n = getNodeText(c, source).trim();
+      if (n) names.add(n);
+      break;
+    }
+  }
+
+  const stack: SyntaxNode[] = [body];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (SV_LOCAL_DECL_NODES.has(cur.type)) {
+      // The declarator name is a DIRECT child; a type name sits deeper (under
+      // data_type_or_implicit), so direct children alone keep types out.
+      const named = getChildByField(cur, 'name');
+      if (named) {
+        const n = getNodeText(named, source).trim();
+        if (n) names.add(n);
+      } else {
+        for (const id of childrenOfType(cur, 'simple_identifier')) {
+          const n = getNodeText(id, source).trim();
+          if (n) names.add(n);
+        }
+      }
+    }
+    for (let i = 0; i < cur.namedChildCount; i++) {
+      const c = cur.namedChild(i);
+      if (c) stack.push(c);
+    }
+  }
+  return names;
+}
+
+/**
+ * Names declared local to the subroutine `node` sits in, or undefined when the
+ * declaration walker is driving (module scope -- nothing to suppress).
+ */
+function subroutineLocals(node: SyntaxNode, ctx: ExtractorContext): Set<string> | undefined {
+  if (!ctx.inSubroutineBody) return undefined;
+  const body = enclosingSubroutineBody(node);
+  if (!body) return undefined;
+  const key = `${ctx.filePath}|${body.startIndex}`;
+  let names = svLocalNamesByBody.get(key);
+  if (!names) {
+    names = collectSubroutineLocals(body, ctx.source);
+    svLocalNamesByBody.set(key, names);
+  }
+  return names;
+}
+
 export const systemverilogExtractor: LanguageExtractor = {
   // The blanking function stays PURE (it is exported and tested as such); the
   // side effect that captures directive macro names before they are destroyed
@@ -1047,10 +1186,19 @@ export const systemverilogExtractor: LanguageExtractor = {
   visitNode: (node: SyntaxNode, ctx: ExtractorContext): boolean => {
     const t = node.type;
 
+    // The BODY walker is driving. Only the reference-emitting branches may run
+    // -- see SV_SUBROUTINE_BODY_NODES. `false` means "keep walking", so the
+    // body walker still descends and still finds its calls; it just never
+    // reaches a branch that would create a node for a procedural local.
+    if (ctx.inSubroutineBody && !SV_SUBROUTINE_BODY_NODES.has(t)) return false;
+
     // Macro references recorded during pre-parse, drained once at the file root.
     // They are emitted from the FILE node because a conditional directive
     // usually sits outside any module.
     if (t === 'source_file') {
+      // First node of this file's walk: drop any subroutine-local name sets a
+      // previous file left behind.
+      svLocalNamesByBody.clear();
       const fileId = ctx.nodeStack[ctx.nodeStack.length - 1];
       const pending = takeDirectiveMacroUses(ctx.filePath);
       if (fileId) {
@@ -1123,11 +1271,13 @@ export const systemverilogExtractor: LanguageExtractor = {
       const ids = childrenOfType(node, 'simple_identifier');
       const line = node.startPosition.row + 1;
       const column = node.startPosition.column;
+      // Empty unless a subroutine body is being walked; see the block above.
+      const locals = subroutineLocals(node, ctx);
 
       if (ids.length === 1) {
         if (ids[0] && isReadPosition(node)) {
           const name = getNodeText(ids[0], ctx.source).trim();
-          if (name) {
+          if (name && !locals?.has(name)) {
             ctx.addUnresolvedReference({
               fromNodeId: fromId,
               referenceName: `${SV_READ_PREFIX}${name}`,
@@ -1142,7 +1292,11 @@ export const systemverilogExtractor: LanguageExtractor = {
 
       // Multi-segment: a hierarchical path. Module-scoped binding cannot reach
       // it, so it walks the design hierarchy hop by hop in the post-pass.
-      if (!insideClass(node)) {
+      // A path whose ROOT is a subroutine local is a member select on that
+      // local (`bus.valid` on a local `bus_t bus`), never design hierarchy --
+      // the resolver's own member-select rule cannot see an unindexed local, so
+      // the drop happens here.
+      if (!insideClass(node) && !(ids[0] && locals?.has(getNodeText(ids[0], ctx.source).trim()))) {
         const segments = ids.map((id) => getNodeText(id, ctx.source).trim());
         if (segments.every((seg) => seg.length > 0)) {
           // `w` marks an lvalue path (including force/release), which must reach

@@ -392,6 +392,12 @@ export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
   private source: string;
+  /**
+   * Nesting depth of {@link visitFunctionBody}. Non-zero means the walk is
+   * inside a subroutine BODY, which is what the language hook reads through
+   * `ExtractorContext.inSubroutineBody` to stay reference-only there.
+   */
+  private subroutineBodyDepth = 0;
   private tree: Tree | null = null;
   private nodes: Node[] = [];
   private edges: Edge[] = [];
@@ -1488,6 +1494,7 @@ export class TreeSitterExtractor {
       get source() { return self.source; },
       get nodeStack() { return self.nodeStack; },
       get nodes() { return self.nodes; },
+      get inSubroutineBody() { return self.subroutineBodyDepth > 0; },
     };
   }
 
@@ -5220,12 +5227,35 @@ export class TreeSitterExtractor {
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
+    // The language hook, for the languages whose dataflow lives in procedural
+    // statements. Built once per body rather than per node: every member is a
+    // getter delegating to `self`, so one instance is valid for the whole walk.
+    const hookCtx =
+      this.language === 'systemverilog' && this.extractor.visitNode
+        ? this.makeExtractorContext()
+        : undefined;
+
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
 
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.
       this.maybeCaptureFnRefs(node, nodeType);
+
+      // Language hook, same contract as visitNode: `true` means the hook
+      // consumed the subtree, so stop descending.
+      //
+      // SystemVerilog only, and the gate is not caution — it is the difference
+      // between the two walkers. A task/function body is walked HERE, so every
+      // reference a procedural statement makes (`sda = cfg_word[0]`, a
+      // sensitivity read, a backdoor `top.u_core.state = 0`) was invisible to
+      // the graph: the behavioral bus models, which are almost entirely task
+      // body, contributed no drivers and no readers at all. Every other
+      // language's hook is written against the DECLARATION walker and would
+      // start re-creating nodes from body scope if called here; SV's hook
+      // refuses to create nodes while `ctx.inSubroutineBody`, which is what
+      // keeps procedural locals unindexed.
+      if (hookCtx && this.extractor!.visitNode!(node, hookCtx)) return;
 
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
@@ -5377,7 +5407,12 @@ export class TreeSitterExtractor {
       }
     };
 
-    visitForCallsAndStructure(body);
+    this.subroutineBodyDepth++;
+    try {
+      visitForCallsAndStructure(body);
+    } finally {
+      this.subroutineBodyDepth--;
+    }
   }
 
   /**

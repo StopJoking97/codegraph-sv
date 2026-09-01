@@ -68,6 +68,17 @@ export interface ExtractorContext {
   readonly nodeStack: readonly string[];
   /** All nodes extracted so far */
   readonly nodes: readonly Node[];
+  /**
+   * True while the hook is being driven by the function-BODY walker rather than
+   * the declaration walker.
+   *
+   * A body walk sees procedural statements, and procedural locals are
+   * deliberately unindexed engine-wide — creating a node from body scope would
+   * both explode the graph and invent a declaration the resolver has no scope
+   * rule for. A hook that runs in both walkers must therefore emit references
+   * only while this is true.
+   */
+  readonly inSubroutineBody: boolean;
 }
 
 /**
