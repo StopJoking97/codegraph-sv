@@ -3543,7 +3543,20 @@ export class ToolHandler {
       // them — only this seeding tier was callable-only. The NL-stopword guard
       // below applies unchanged, so bare English words still can't seed a
       // same-named local. Callables keep priority via the body-size sort.
-      const SEEDABLE = new Set([...CALLABLE, 'variable', 'constant']);
+      //
+      // `field` is here for the same reason, and it is the whole answer to
+      // finding 28. Every HDL net, port and register indexes as `field`, so on
+      // a hardware design the ONE thing an engineer names — `cfg_tx_offset`,
+      // `status_reg` — could never seed. Its file then competed on text
+      // rank alone against files reached only by graph expansion, and lost:
+      // on a real design, `explore cfg_tx_offset` led with
+      // three files containing ZERO occurrences of the token while the sole
+      // consumer fell into the unshown overflow. FTS was never the problem
+      // (`nodes_fts MATCH` returns exactly the right row); the named tier
+      // simply could not see the kind. Class fields in every other language
+      // ride the same channel object-literal keys already reach via the #1196
+      // camel-infix fallback, under all the guards below.
+      const SEEDABLE = new Set([...CALLABLE, 'variable', 'constant', 'field']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
       const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
