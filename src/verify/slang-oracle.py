@@ -135,19 +135,37 @@ def main():
     # DEFINES cannot be injected at all. Say so in the report rather than
     # pretending the run was fully preprocessed — a verify pass that overstates
     # its own rigour is worse than one that grades loosely and admits it.
+    #
+    # Each directory is applied INDEPENDENTLY. They used to share one try, so a
+    # single unusable path -- a stale entry in codegraph.json, a directory that
+    # only exists on another machine -- threw on the first bad one and
+    # abandoned every good one with it. The run then graded syntax-only, found
+    # no cross-file declaration, reported zero MISSING and exited 0: a strictly
+    # weaker run presented as a clean pass. One bad path must cost only itself.
     source_manager = None
     mode = "syntax-only"
     notes = []
     if include_dirs:
         try:
             source_manager = pyslang.SourceManager()
-            for d in include_dirs:
-                source_manager.addUserDirectories(d)  # one path per call in 11.x
-            mode = "preprocessed"
         except Exception as exc:  # noqa: BLE001
-            notes.append("include directories could not be applied (%s); graded syntax-only" % exc)
+            notes.append("a SourceManager could not be created (%s); graded syntax-only" % exc)
             source_manager = None
-            mode = "syntax-only"
+        if source_manager is not None:
+            applied = 0
+            for d in include_dirs:
+                try:
+                    source_manager.addUserDirectories(d)  # one path per call in 11.x
+                    applied += 1
+                except Exception as exc:  # noqa: BLE001
+                    notes.append("include directory could not be applied: %s (%s)" % (d, exc))
+            if applied > 0:
+                mode = "preprocessed"
+            else:
+                # Nothing resolved, so the manager buys nothing and its presence
+                # would only make the mode field lie.
+                notes.append("no configured include directory could be applied; graded syntax-only")
+                source_manager = None
     if defines:
         notes.append(
             "pyslang %s exposes no way to predefine macros from Python, so %d define(s) were NOT applied"

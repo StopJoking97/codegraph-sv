@@ -107,6 +107,8 @@ export type VerifyOutcome =
        * worst outcome available — the design is real and unverified.
        */
       indexedFilesTotal: number;
+      /** Configured `verify.includeDirs` that are not directories on disk. */
+      unusableIncludeDirs: string[];
     }
   | {
       status: 'ok';
@@ -127,6 +129,17 @@ export type VerifyOutcome =
       configured: boolean;
       /** Files the grader could not parse at all. */
       parseFailed: string[];
+      /**
+       * Configured `verify.includeDirs` that are not directories on disk.
+       *
+       * A run that could not apply the include path it was configured with is
+       * strictly weaker than the one asked for, and the weakening is INVISIBLE
+       * in the score: unresolved includes mean the front end never sees the
+       * declarations, so nothing is MISSING and the run exits 0 looking clean.
+       * That is the same false-green shape as grading nothing at all, so it is
+       * gated the same way.
+       */
+      unusableIncludeDirs: string[];
     };
 
 /** Normalize an index path to the forward-slash form the oracle speaks. */
@@ -191,6 +204,17 @@ export function verifyIndex(
   }
   const scoped = scopeFiles(indexedPaths, config.include, config.exclude);
 
+  // Checked HERE rather than trusted to the oracle's notes: the oracle can only
+  // report what it tried, and a note is not a gate. This is a configuration
+  // fact the caller can establish directly, name precisely, and act on.
+  const unusableIncludeDirs = config.includeDirs.filter((d) => {
+    try {
+      return !fs.statSync(path.join(root, d.replace(/\//g, path.sep))).isDirectory();
+    } catch {
+      return true; // absent, unreadable — either way it cannot serve an include
+    }
+  });
+
   // Stale-entry detection needs no grader, so it runs first and reports even on
   // a skip. This is the defect class that produced confidently wrong answers:
   // an index that answers about a file which no longer exists.
@@ -218,6 +242,7 @@ export function verifyIndex(
       scopedFiles: scoped.length,
       indexedFiles: indexedPaths.length,
       indexedFilesTotal,
+      unusableIncludeDirs,
     };
   }
 
@@ -281,6 +306,7 @@ export function verifyIndex(
     minCoverage: config.minCoverage,
     configured: config.configured,
     parseFailed: outcome.report.parseFailed,
+    unusableIncludeDirs,
   };
 }
 
@@ -329,6 +355,20 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
   const { result, report } = outcome;
 
   lines.push(`codegraph verify — graded by ${report.oracle} ${report.version} (${report.mode})`);
+  // Named first: it changes what every number below is worth. A run whose
+  // include path did not apply cannot see the declarations behind it, so a
+  // clean score here means "found nothing to disagree about", not "agreed".
+  const badDirs = outcome.unusableIncludeDirs ?? [];
+  if (badDirs.length > 0) {
+    lines.push('');
+    lines.push(`  INCLUDE DIRS — ${badDirs.length} configured path(s) are not directories on disk:`);
+    for (const d of badDirs.slice(0, 20)) lines.push(`    ${d}`);
+    if (badDirs.length > 20) lines.push(`    ... +${badDirs.length - 20} more`);
+    lines.push('  Declarations behind those includes were never reached, so the figures below');
+    lines.push('  are a WEAKER run than the one configured, not a cleaner one.');
+    if (strict) lines.push('  STRICT: failing — fix the path or drop it from verify.includeDirs.');
+    lines.push('');
+  }
   if (!outcome.configured) {
     lines.push('  mode: SYNTAX-ONLY — no `verify` block in codegraph.json, so no include path and no defines.');
     lines.push('        Files that depend on headers are graded loosely; add includeDirs/defines to tighten it.');
@@ -472,6 +512,12 @@ export function verifyExitCode(outcome: VerifyOutcome, strict = false): number {
     // catch. A TypeScript repo genuinely owes nothing and passes.
     return outcome.indexedFilesTotal === 0 ? 1 : 0;
   }
+  // An include path the run could not apply makes the run weaker than the one
+  // configured, and says so nowhere the score can see: the front end never
+  // reaches the declarations, so nothing reads MISSING and a degraded run exits
+  // 0 looking like a clean pass. Measured: one stale entry in a two-entry
+  // includeDirs list took a real project from many MISSING to a green 0.
+  if ((outcome.unusableIncludeDirs ?? []).length > 0) return 1;
   if (outcome.status === 'skipped') return 1;
   // A run proves only as much as it covered, and the denominator is the whole
   // indexed design — NOT what survived the config's globs. Measuring coverage

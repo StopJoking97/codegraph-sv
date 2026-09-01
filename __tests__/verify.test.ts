@@ -863,3 +863,110 @@ describe('verify — `include attribution (the origin file owns the name)', () =
     }
   );
 });
+
+describe('verify — an unusable include dir must not degrade the run silently', () => {
+  let tempDir: string;
+
+  /** The smallest outcome the gate accepts: graded, complete, nothing missing. */
+  const okOutcomeForGate = () => ({
+    status: 'ok' as const,
+    report: {
+      oracle: 'pyslang',
+      version: `${SUPPORTED_ORACLE_MAJORS[0]}.0.0`,
+      mode: 'preprocessed' as const,
+      notes: [],
+      files: {},
+      parseFailed: [],
+      notOnDisk: [],
+    },
+    result: summarize([{ file: 'a.v', graded: 1, hit: 1, disagreements: [] }]),
+    staleFiles: [],
+    scopedFiles: 1,
+    indexedFiles: 1,
+    indexedFilesTotal: 1,
+    gradedFiles: 1,
+    minCoverage: 1,
+    configured: true,
+    parseFailed: [],
+    unusableIncludeDirs: [] as string[],
+  });
+
+  afterEach(() => {
+    if (tempDir && fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  function fixture(includeDirs: string[]): string {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-verify-incdir-'));
+    fs.mkdirSync(path.join(tempDir, 'rtl', 'include'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'rtl', 'include', 'defs.svh'),
+      'parameter INCLUDED_PARAM = 4;\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'rtl', 'user.sv'),
+      'module user;\n`include "defs.svh"\n  wire own_sig;\nendmodule\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'codegraph.json'),
+      JSON.stringify({ verify: { includeDirs } })
+    );
+    clearProjectConfigCache();
+    return tempDir;
+  }
+
+  it('exit code: a configured include dir that is not a directory fails strict', () => {
+    // Pure, so it runs everywhere. The exit code is the whole point: a note
+    // nobody reads is how this degradation stayed invisible.
+    const clean = { unusableIncludeDirs: [] };
+    const broken = { unusableIncludeDirs: ['rtl/nope'] };
+    expect(verifyExitCode({ ...okOutcomeForGate(), ...clean }, true)).toBe(0);
+    expect(verifyExitCode({ ...okOutcomeForGate(), ...broken }, true)).toBe(1);
+    // Not strict: still advisory, like every other verify finding.
+    expect(verifyExitCode({ ...okOutcomeForGate(), ...broken }, false)).toBe(0);
+  });
+
+  it.runIf(ORACLE_AVAILABLE)(
+    'fails strict, and names the dir, when a configured include dir does not exist',
+    async () => {
+      // The defect this test exists for: one bad path made the oracle abandon
+      // ALL include dirs and grade syntax-only, which found no cross-file
+      // declarations, which produced zero MISSING, which exited 0. A weaker
+      // run reported as a clean pass.
+      const root = fixture(['rtl/include', 'rtl/nope']);
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        const outcome = cg.verify({ timeoutMs: 60_000 });
+        expect(verifyExitCode(outcome, true)).toBe(1);
+        const text = formatVerifyReport(outcome, true);
+        expect(text).toContain('rtl/nope');
+        expect(text).toContain('INCLUDE DIRS');
+      } finally {
+        cg.destroy();
+      }
+    }
+  );
+
+  it.runIf(ORACLE_AVAILABLE)(
+    'keeps the usable include dirs working when one of them is bad',
+    async () => {
+      // The other half: a bad dir must cost only itself. Before, the whole
+      // preprocessed mode was abandoned, so defs.svh was never found at all.
+      const root = fixture(['rtl/include', 'rtl/nope']);
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        const outcome = cg.verify({ timeoutMs: 60_000 });
+        expect(outcome.status).toBe('ok');
+        if (outcome.status !== 'ok') return;
+        expect(outcome.report.mode).toBe('preprocessed');
+        // rtl/include still resolved, so the header's own name is graded there.
+        expect(outcome.report.files['rtl/include/defs.svh']?.scope).toContain(
+          'INCLUDED_PARAM'
+        );
+      } finally {
+        cg.destroy();
+      }
+    }
+  );
+});
