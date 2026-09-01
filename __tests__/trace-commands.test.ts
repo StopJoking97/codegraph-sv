@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { whoDrives, whoReads, instancesOf, siteCount, type TraceSource } from '../src/trace';
+import { whoDrives, whoReads, instancesOf, siteCount, followNet, type TraceSource } from '../src/trace';
 import type { Edge, Node } from '../src/types';
 
 function node(id: string, name: string, kind: Node['kind'], filePath: string, startLine: number): Node {
@@ -213,5 +213,130 @@ describe('result contract', () => {
     const r = whoDrives(g, 'tx_dat_o');
     expect(r.matches).toHaveLength(2);
     expect(r.matches.map((m) => m.sites[0]!.line).sort()).toEqual([21, 51]);
+  });
+});
+
+// --- follow-net: chase a net across module walls, through its renames -------
+//
+// A synthetic three-level chain. Two shapes matter:
+//   the RENAME  `go_in` inside rx_core is the parent's `start_req` —
+//               the leaf name an engineer knows is not the boundary name.
+//   the CLIMB   `cfg_rx_en` reaches its writer three module walls up,
+//               keeping its name after the first wall.
+const chain = makeGraph(
+  [
+    node('f:rxen', 'cfg_rx_en', 'field', 'rtl/rx_top.v', 4),
+    node('f:rrdy_mif', 'rd_ready', 'field', 'rtl/mid_top.v', 7),
+    node('f:rrdy_core', 'rd_ready', 'field', 'rtl/core_blk.v', 2),
+    node('f:rrdy_cblk', 'rd_ready', 'field', 'rtl/ctrl_blk.v', 8),
+    node('m:cblk', 'ctrl_blk', 'module', 'rtl/ctrl_blk.v', 1),
+    // The legacy twin: same name, no connections at all.
+    node('f:rxen_dsp', 'cfg_rx_en', 'field', 'rtl/dsp_blk.v', 5),
+  ],
+  [
+    edge('f:rrdy_mif', 'f:rxen', 'connects', 110, { port: 'cfg_rx_en', portDirection: 'input', instance: 'u_rx0' }),
+    edge('f:rrdy_core', 'f:rrdy_mif', 'connects', 170, { port: 'rd_ready', portDirection: 'input', instance: 'u_mid' }),
+    edge('f:rrdy_cblk', 'f:rrdy_core', 'connects', 160, { port: 'rd_ready', portDirection: 'output', instance: 'u_ctrl' }),
+    edge('m:cblk', 'f:rrdy_cblk', 'drives', 64),
+  ],
+  { drives: 530, connects: 19, reads: 370, hier_ref: 11, instantiates: 2 },
+);
+
+describe('follow-net — chase a net across module walls', () => {
+  it('climbs every wall from the leaf name to the statement that writes it', () => {
+    // The whole point: who-drives answers ONE wall. An engineer holding
+    // `cfg_rx_en` gets `rd_ready` and has to re-query, by hand, per
+    // wall, guessing the new name each time.
+    const r = followNet(chain, 'cfg_rx_en');
+    const real = r.matches.find((m) => m.node.filePath.includes('rx_top'))!;
+    expect(real.hops.map((h) => `${h.name}@${h.siteFile}:${h.siteLine}`)).toEqual([
+      'rd_ready@rtl/mid_top.v:110',
+      'rd_ready@rtl/core_blk.v:170',
+      'rd_ready@rtl/ctrl_blk.v:160',
+      'ctrl_blk@rtl/ctrl_blk.v:64',
+    ]);
+    expect(real.hops.map((h) => h.depth)).toEqual([0, 1, 2, 3]);
+    expect(real.hops[3]!.via).toBe('drives');
+    expect(real.stop).toBe('driver');
+  });
+
+  it('marks the hop where the name changes, and only that hop', () => {
+    // The rename is the fact a debugger needs flagged: it is where grepping
+    // the old name stops working.
+    const r = followNet(chain, 'cfg_rx_en');
+    const real = r.matches.find((m) => m.node.filePath.includes('rx_top'))!;
+    expect(real.hops.filter((h) => h.renamed).map((h) => h.name)).toEqual(['rd_ready']);
+  });
+
+  it('proves absence with a denominator rather than returning silence', () => {
+    const r = followNet(chain, 'cfg_rx_en');
+    const legacy = r.matches.find((m) => m.node.filePath.includes('dsp_blk'))!;
+    expect(legacy.hops).toEqual([]);
+    expect(legacy.stop).toBe('no-connections');
+    expect(r.edgesConsulted).toBe(530 + 19);
+  });
+
+  it('walks the other way too, so either end of the chain is a valid start', () => {
+    const r = followNet(chain, 'rd_ready', 'downstream');
+    const fromWriter = r.matches.find((m) => m.node.filePath.includes('ctrl_blk'))!;
+    expect(fromWriter.hops.map((h) => `${h.name}@${h.siteFile}:${h.siteLine}`)).toEqual([
+      'rd_ready@rtl/core_blk.v:160',
+      'rd_ready@rtl/mid_top.v:170',
+      'cfg_rx_en@rtl/rx_top.v:110',
+    ]);
+  });
+
+  it('reports an unindexed name as a miss with near misses, never as absence', () => {
+    const r = followNet(chain, 'no_such_net');
+    expect(r.matches).toEqual([]);
+    expect(r.nearMisses).toEqual([]);
+  });
+
+  it('calls a shared upstream chain a revisit, NOT a cycle', () => {
+    // Three instantiations of one child share one upstream chain. Reporting
+    // that as a cycle would be a wrong answer about the DESIGN — it says the
+    // netlist loops when it does not. The first
+    // implementation of this walk called cfg_rx_en cyclic for exactly this
+    // reason.
+    const shared = makeGraph(
+      [node('f:port', 'p', 'field', 'child.v', 1), node('f:net', 'n', 'field', 'parent.v', 1),
+       node('m:par', 'parent', 'module', 'parent.v', 1)],
+      [
+        edge('f:net', 'f:port', 'connects', 10, { port: 'p', portDirection: 'input', instance: 'u0' }),
+        edge('f:net', 'f:port', 'connects', 20, { port: 'p', portDirection: 'input', instance: 'u1' }),
+        edge('m:par', 'f:net', 'drives', 5),
+      ],
+      { drives: 1, connects: 2 },
+    );
+    const m = followNet(shared, 'p').matches[0]!;
+    expect(m.stop).toBe('driver');
+    expect(m.hops.filter((h) => h.revisit)).toHaveLength(1);
+  });
+
+  it('separates "crossed walls but found no writer" from "wired to nothing"', () => {
+    // Both are zero drivers; they are not the same fact, and collapsing them
+    // hides a capability gap behind a design claim.
+    const dangling = makeGraph(
+      [node('f:a', 'a', 'field', 'a.v', 1), node('f:b', 'b', 'field', 'b.v', 1),
+       node('f:lonely', 'lonely', 'field', 'c.v', 1)],
+      [edge('f:b', 'f:a', 'connects', 10, { port: 'a', portDirection: 'input', instance: 'u0' })],
+      { drives: 0, connects: 1 },
+    );
+    expect(followNet(dangling, 'a').matches[0]!.stop).toBe('no-driver');
+    expect(followNet(dangling, 'lonely').matches[0]!.stop).toBe('no-connections');
+  });
+
+  it('terminates on a cycle instead of walking it forever', () => {
+    const cyc = makeGraph(
+      [node('f:a', 'a', 'field', 'a.v', 1), node('f:b', 'b', 'field', 'b.v', 1)],
+      [
+        edge('f:b', 'f:a', 'connects', 10, { port: 'a', portDirection: 'input', instance: 'u_a' }),
+        edge('f:a', 'f:b', 'connects', 20, { port: 'b', portDirection: 'input', instance: 'u_b' }),
+      ],
+      { drives: 0, connects: 2 },
+    );
+    const r = followNet(cyc, 'a');
+    expect(r.matches[0]!.hops.length).toBeLessThan(5);
+    expect(r.matches[0]!.stop).toBe('cycle');
   });
 });

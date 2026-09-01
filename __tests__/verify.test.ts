@@ -517,6 +517,7 @@ describe('verify — report rendering and exit codes', () => {
       minCoverage: over.minCoverage ?? 1,
       configured: over.configured ?? true,
       parseFailed: [],
+      unusableIncludeDirs: [] as string[],
     };
   };
 

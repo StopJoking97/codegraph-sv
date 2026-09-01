@@ -2252,6 +2252,82 @@ function renderTrace(
 }
 
 /**
+ * Render a follow-net walk as an indented chain.
+ *
+ * Indentation IS the hierarchy: one level per module wall crossed. Each hop
+ * prints the net's name on the far side of that wall, the hookup statement's
+ * `file:line`, and — when it differs — the fact that the name changed, because
+ * the rename is where grepping the name you started with stops working.
+ */
+function renderFollow(
+  result: import('../trace').FollowResult,
+  hopCount: number,
+  json: boolean,
+): void {
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  const arrow = result.direction === 'upstream' ? '<=' : '=>';
+  const heading = `Following "${result.subject}" ${result.direction}`;
+
+  if (result.matches.length === 0) {
+    console.log(chalk.bold(`\n${heading}: NAME NOT INDEXED\n`));
+    console.log(`  No node is named exactly "${result.subject}" in this index.`);
+    if (result.nearMisses.length > 0) {
+      console.log(`  Indexed names containing it:`);
+      for (const n of result.nearMisses) {
+        console.log(chalk.dim(`    ${n.name}  (${n.kind})  ${n.filePath}:${n.startLine}`));
+      }
+    } else {
+      console.log(chalk.dim(`  No indexed name contains that string either.`));
+    }
+    console.log();
+    return;
+  }
+
+  console.log(chalk.bold(`\n${heading} (${hopCount} hop(s)):\n`));
+  for (const match of result.matches) {
+    console.log(
+      chalk.cyan(match.node.kind.padEnd(12)) +
+      chalk.white(match.node.name) +
+      chalk.dim(`  declared ${match.node.filePath}:${match.node.startLine}`),
+    );
+    if (match.hops.length === 0) {
+      console.log(
+        chalk.dim(
+          `    0 hops — absence proven against ${result.edgesConsulted} ` +
+          `${result.kindsConsulted.join('/')} edges in this index`,
+        ),
+      );
+    }
+    for (const hop of match.hops) {
+      const pad = '  '.repeat(hop.depth + 1);
+      const loc = hop.siteLine === null ? hop.siteFile : `${hop.siteFile}:${hop.siteLine}`;
+      const detail = hop.detail ? ` ${hop.detail}` : '';
+      const marks =
+        (hop.renamed ? chalk.cyan('  [renamed]') : '') +
+        (hop.ambiguous ? chalk.yellow('  [direction not distinguished]') : '') +
+        (hop.revisit ? chalk.dim('  [already expanded above]') : '');
+      const label = hop.via === 'drives' ? 'drives' : `connects${detail}`;
+      console.log(`${pad}${arrow} ${chalk.white(hop.name)} ${chalk.dim(`(${label})`)} — ${loc}${marks}`);
+    }
+    console.log(chalk.dim(`    stopped: ${match.stop}`));
+    console.log();
+  }
+
+  if (hopCount === 0) {
+    console.log(
+      chalk.dim(
+        `Absence is the answer: ${result.edgesConsulted} ${result.kindsConsulted.join('/')} ` +
+        `edges exist in this index and none crosses a wall from "${result.subject}".\n`,
+      ),
+    );
+  }
+}
+
+/**
  * Shared body for the three trace commands: open, gate on capability, run the
  * ranking-free query, render.
  */
@@ -2322,6 +2398,41 @@ program
     } catch (err) {
       error(`who-reads failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
+    }
+  });
+
+program
+  .command('follow-net <net>')
+  .description('Chase a net across module walls through its renames, to the statement that writes it')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .option('-d, --downstream', 'Walk toward what the net feeds instead of what feeds it')
+  .action(async (net: string, options: { path?: string; json?: boolean; downstream?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+    if (!isInitialized(projectPath)) {
+      error(`CodeGraph not initialized in ${projectPath}`);
+      process.exit(1);
+    }
+    const { default: CodeGraph } = await loadCodeGraph();
+    const { capabilityOf, capabilityGap, capabilityGapMessage, TRACE_EDGE_KINDS } =
+      await import('../index-capability');
+    const trace = await import('../trace');
+    const cg = await CodeGraph.open(projectPath);
+    try {
+      const gap = capabilityGap(capabilityOf(cg), TRACE_EDGE_KINDS.follow);
+      if (gap) {
+        const alternatives = await censusReachable(cg.getProjectRoot());
+        error(capabilityGapMessage(gap, { subject: net, alternatives, retargetAs: '--path' }));
+        cg.destroy();
+        process.exit(EXIT_CAPABILITY_GAP);
+      }
+      const result = trace.followNet(cg, net, options.downstream ? 'downstream' : 'upstream');
+      renderFollow(result, trace.hopCount(result), !!options.json);
+    } catch (err) {
+      error(`follow-net failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    } finally {
+      cg.destroy();
     }
   });
 

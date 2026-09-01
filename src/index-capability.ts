@@ -74,10 +74,13 @@ export interface CapabilityGap {
  * module — an index with `drives` but no `connects` answers the question
  * half-blind and says so nowhere.
  */
-export const TRACE_EDGE_KINDS: Record<'drivers' | 'readers' | 'instances', EdgeKind[]> = {
+export const TRACE_EDGE_KINDS: Record<'drivers' | 'readers' | 'instances' | 'follow', EdgeKind[]> = {
   drivers: ['drives', 'connects'],
   readers: ['reads', 'connects'],
   instances: ['instantiates'],
+  // Following a net across module walls is `connects` to cross and `drives` to
+  // stop, so it is decidable from exactly what `drivers` needs.
+  follow: ['drives', 'connects'],
 };
 
 /**
