@@ -115,9 +115,10 @@ LOCAL_SCOPES = {
 # and graded loosely, visibly. Three tests, all required:
 #   1. the compilation unit holds no declaration container,
 #   2. slang reported a member-level complaint (NotAllowedInCU / ExpectedMember),
-#   3. the same text wrapped in `initial begin ... end` parses with strictly
-#      fewer errors -- it reads as statements. A header of module items (`wire`,
-#      `assign`) parses WORSE when wrapped, so it stays strictly graded.
+#   3. the same text wrapped in `initial begin ... end` parses with NO error --
+#      it is a valid statement list. "Fewer errors" is not enough: an
+#      item-level include of assigns and always blocks fails slightly less
+#      often when wrapped, and it must stay strictly graded.
 CONTAINER_KINDS = {
     "SyntaxKind.ModuleDeclaration",
     "SyntaxKind.PackageDeclaration",
@@ -338,7 +339,7 @@ def main():
                 wrapped = SyntaxTree.fromText(wrapped_text, "fragment")
         except Exception:  # noqa: BLE001
             return None
-        if len(error_codes(wrapped)) >= len(standalone):
+        if error_codes(wrapped):
             return None
         names = set()
 

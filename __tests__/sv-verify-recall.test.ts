@@ -283,6 +283,23 @@ const FRAGMENT_FORK = [
 /** Module items meant to be `include-d inside a module: still graded strictly. */
 const ITEM_HEADER = ['parameter P = 4;', 'wire w;', 'logic [3:0] v;', 'assign w = 1\'b0;', ''].join('\n');
 
+/**
+ * A larger item-level include (assigns, always blocks, an instance). Every
+ * item draws a NotAllowedInCU standalone, and wrapped in a procedural block
+ * it still fails, only slightly less often: fewer errors is not "parses as
+ * statements", so it must stay strictly graded.
+ */
+const ITEM_HOOK = [
+  'wire ha, hb;',
+  "assign ha = 1'b0;",
+  'assign hb = ha;',
+  'always @(ha) $display("%b", ha);',
+  'always @(hb) $display("%b", hb);',
+  'initial $display("start");',
+  'sub u_s(.x(ha));',
+  '',
+].join('\n');
+
 describe('oracle-backed — covergroup formals and statement fragments', () => {
   let tempDir: string | undefined;
 
@@ -316,10 +333,15 @@ describe('oracle-backed — covergroup formals and statement fragments', () => {
   });
 
   it.runIf(ORACLE_AVAILABLE)('cause 4: marks a statement-list file as a fragment, and an item header not', () => {
-    const root = write({ 'frag_loop.sv': FRAGMENT_LOOP, 'frag_fork.sv': FRAGMENT_FORK, 'items.svh': ITEM_HEADER });
+    const root = write({
+      'frag_loop.sv': FRAGMENT_LOOP,
+      'frag_fork.sv': FRAGMENT_FORK,
+      'items.svh': ITEM_HEADER,
+      'hook.svh': ITEM_HOOK,
+    });
     const outcome = runGrader({
       root,
-      files: ['frag_loop.sv', 'frag_fork.sv', 'items.svh'],
+      files: ['frag_loop.sv', 'frag_fork.sv', 'items.svh', 'hook.svh'],
       includeDirs: [],
       defines: {},
       timeoutMs: 60_000,
@@ -337,6 +359,8 @@ describe('oracle-backed — covergroup formals and statement fragments', () => {
     // Module items read as members, not statements: graded strictly.
     expect(files['items.svh']?.fragment).toBeFalsy();
     expect(files['items.svh']?.scope).toEqual(expect.arrayContaining(['P', 'w', 'v']));
+    expect(files['hook.svh']?.fragment).toBeFalsy();
+    expect(files['hook.svh']?.scope).toEqual(expect.arrayContaining(['ha', 'hb']));
   });
 
   it.runIf(ORACLE_AVAILABLE)('all four: a project of the four shapes verifies strict with 0 MISSING and 0 UNEXPLAINED', async () => {
