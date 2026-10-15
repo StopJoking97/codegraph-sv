@@ -315,8 +315,31 @@ function emitStructMembers(dataType: SyntaxNode, ctx: ExtractorContext, depth = 
     }
     const typeText = memberType ? getNodeText(memberType, ctx.source).trim() : '';
     emitSignalNodes(ids, member, 'field', typeText.split(/[\s[#{]/)[0] || 'var', ctx);
+    if (memberType) emitInlineEnumConstants(memberType, ctx);
     const inner = memberType ? structUnionDataType(memberType) : undefined;
     if (inner) emitStructMembers(inner, ctx, depth + 1);
+  }
+}
+
+/**
+ * One `enum_member` node per constant of an enum declared inline in a member's
+ * type (`enum logic [1:0] {A, B} mode;`), in the current scope. A nested
+ * struct's members are left to the recursion of emitStructMembers.
+ */
+function emitInlineEnumConstants(memberType: SyntaxNode, ctx: ExtractorContext): void {
+  const q: SyntaxNode[] = [memberType];
+  let guard = 0;
+  while (q.length && guard++ < 512) {
+    const cur = q.shift()!;
+    if (cur.type === 'enum_name_declaration') {
+      const mn = svName(cur, ctx.source);
+      if (mn) ctx.createNode('enum_member', mn, cur);
+      continue;
+    }
+    for (let i = 0; i < cur.namedChildCount; i++) {
+      const c = cur.namedChild(i);
+      if (c && c.type !== 'struct_union_member') q.push(c);
+    }
   }
 }
 

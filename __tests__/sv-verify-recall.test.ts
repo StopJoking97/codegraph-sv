@@ -204,6 +204,33 @@ describe('cause 2 — struct and union members', () => {
     expect(parentName(r, r.nodes.find((n) => n.name === 'w'))).toBe('m');
   });
 
+  it('keeps the constants of an enum declared inline in a struct member', () => {
+    const inline = [
+      'package q;',
+      '  typedef struct packed {',
+      '    enum logic [1:0] { MA, MB } mode;',
+      '    logic en;',
+      '  } c_t;',
+      'endpackage',
+      'module n;',
+      '  struct packed { enum logic { NA, NB } k; struct packed { enum logic { OA, OB } j; } s; } v;',
+      'endmodule',
+      '',
+    ].join('\n');
+    const r = extractFromSource('inline_enum.sv', inline);
+    for (const name of ['mode', 'en']) {
+      expect(parentName(r, r.nodes.find((n) => n.name === name)), name).toBe('c_t');
+    }
+    const members = r.nodes.filter((n) => n.kind === 'enum_member');
+    expect(members.map((n) => n.name).sort()).toEqual(['MA', 'MB', 'NA', 'NB', 'OA', 'OB']);
+    for (const name of ['MA', 'MB']) {
+      expect(parentName(r, r.nodes.find((n) => n.name === name)), name).toBe('c_t');
+    }
+    for (const name of ['NA', 'NB', 'OA', 'OB']) {
+      expect(parentName(r, r.nodes.find((n) => n.name === name)), name).toBe('n');
+    }
+  });
+
   it('keeps an enum typedef an enum with its members', () => {
     const r = extractFromSource('struct_pkg.sv', src);
     expect(r.nodes.find((n) => n.name === 'e_t')?.kind).toBe('enum');
@@ -361,6 +388,29 @@ describe('oracle-backed — covergroup formals and statement fragments', () => {
     expect(files['items.svh']?.scope).toEqual(expect.arrayContaining(['P', 'w', 'v']));
     expect(files['hook.svh']?.fragment).toBeFalsy();
     expect(files['hook.svh']?.scope).toEqual(expect.arrayContaining(['ha', 'hb']));
+  });
+
+  it.runIf(ORACLE_AVAILABLE)('cause 4: a file holding a module item (continuous assign) is never a fragment', () => {
+    // Wrapped in `initial begin ... end` these parse clean (`assign` reads as a
+    // procedural continuous assign), so only the item kind can tell them apart.
+    const root = write({
+      'item_assign.svh': ['logic x;', 'assign x = y;', ''].join('\n'),
+      'item_vars.svh': ['logic [7:0] a; logic b; assign b = a[0];', ''].join('\n'),
+    });
+    const outcome = runGrader({
+      root,
+      files: ['item_assign.svh', 'item_vars.svh'],
+      includeDirs: [],
+      defines: {},
+      timeoutMs: 60_000,
+    });
+    expect(outcome.status).toBe('ok');
+    if (outcome.status !== 'ok') return;
+    const files = outcome.report.files;
+    expect(files['item_assign.svh']?.fragment).toBeFalsy();
+    expect(files['item_assign.svh']?.scope).toEqual(expect.arrayContaining(['x']));
+    expect(files['item_vars.svh']?.fragment).toBeFalsy();
+    expect(files['item_vars.svh']?.scope).toEqual(expect.arrayContaining(['a', 'b']));
   });
 
   it.runIf(ORACLE_AVAILABLE)('all four: a project of the four shapes verifies strict with 0 MISSING and 0 UNEXPLAINED', async () => {

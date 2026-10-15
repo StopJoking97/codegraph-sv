@@ -112,8 +112,14 @@ LOCAL_SCOPES = {
 # index recover from it differently (slang reads a procedural `for` as a
 # generate loop and promotes its locals to design scope, and skips a
 # `fork ... join` region as bad tokens). Such a file is reported as a FRAGMENT
-# and graded loosely, visibly. Three tests, all required:
-#   1. the compilation unit holds no declaration container,
+# and graded loosely, visibly. Four tests, all required:
+#   1. the compilation unit holds no declaration container and no member that
+#      only a module body admits (MODULE_ITEM_KINDS): `assign x = y;` wrapped
+#      in a procedural block reads as a procedural continuous assign and parses
+#      clean, so test 3 alone would loosen an item-level include of variables
+#      and assigns. A task call (`f(a);` -> HierarchyInstantiation) and a
+#      procedural `for` / `if` (-> LoopGenerate / IfGenerate) are ambiguous with
+#      statements and are left to test 3,
 #   2. slang reported a member-level complaint (NotAllowedInCU / ExpectedMember),
 #   3. the same text wrapped in `initial begin ... end` parses with NO error --
 #      it is a valid statement list. "Fewer errors" is not enough: an
@@ -126,6 +132,24 @@ CONTAINER_KINDS = {
     "SyntaxKind.ProgramDeclaration",
     "SyntaxKind.ClassDeclaration",
     "SyntaxKind.CheckerDeclaration",
+}
+MODULE_ITEM_KINDS = {
+    "SyntaxKind.ContinuousAssign",
+    "SyntaxKind.NetDeclaration",
+    "SyntaxKind.UserDefinedNetDeclaration",
+    "SyntaxKind.NetTypeDeclaration",
+    "SyntaxKind.AlwaysBlock",
+    "SyntaxKind.AlwaysCombBlock",
+    "SyntaxKind.AlwaysFFBlock",
+    "SyntaxKind.AlwaysLatchBlock",
+    "SyntaxKind.InitialBlock",
+    "SyntaxKind.FinalBlock",
+    "SyntaxKind.GenvarDeclaration",
+    "SyntaxKind.GenerateRegion",
+    "SyntaxKind.DefParam",
+    "SyntaxKind.SpecifyBlock",
+    "SyntaxKind.ClockingDeclaration",
+    "SyntaxKind.ModportDeclaration",
 }
 FRAGMENT_DIAGS = {"NotAllowedInCU", "ExpectedMember"}
 FRAGMENT_WRAP_HEAD = "module __codegraph_fragment__; initial begin\n"
@@ -324,7 +348,7 @@ def main():
             members = list(getattr(tree.root, "members", []) or [])
         except Exception:  # noqa: BLE001
             return None
-        if any(str(getattr(m, "kind", "")) in CONTAINER_KINDS for m in members):
+        if any(str(getattr(m, "kind", "")) in CONTAINER_KINDS | MODULE_ITEM_KINDS for m in members):
             return None
         standalone = error_codes(tree)
         if not FRAGMENT_DIAGS.intersection(standalone):
