@@ -6,6 +6,13 @@ export default defineConfig({
     environment: 'node',
     include: ['__tests__/**/*.test.ts'],
     /**
+     * Every test file runs with HOME / USERPROFILE and the per-OS config
+     * roots redirected to a temp folder, so no installer, upgrade or CLI
+     * path can write into the contributor's real home. See the file.
+     */
+    setupFiles: ['__tests__/setup/isolate-home.ts'],
+    globalSetup: ['__tests__/setup/real-home-sentinel.ts'],
+    /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
      * mcp-roots) spawn `dist/bin/codegraph.js serve --mcp` with `process.execPath`
      * and rely on the child inheriting `process.env`. On a Node >= 25 dev machine
