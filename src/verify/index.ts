@@ -428,6 +428,17 @@ export function formatVerifyReport(outcome: VerifyOutcome, strict = false): stri
   lines.push('  a subroutine or procedural block dies at its block\'s end and is neither probeable,');
   lines.push('  connectable nor driveable. This figure is design-scope recall, not a defect count.');
 
+  const fragments = Object.entries(report.files ?? {})
+    .filter(([, g]) => g.fragment === true)
+    .map(([rel]) => rel)
+    .sort();
+  if (fragments.length > 0) {
+    lines.push('');
+    lines.push(`    FRAGMENTS     ${fragments.length}   (statement lists, not compilation units — graded loosely: no MISSING, no UNEXPLAINED)`);
+    for (const f of fragments.slice(0, 20)) lines.push(`      ${f}`);
+    if (fragments.length > 20) lines.push(`      ... +${fragments.length - 20} more`);
+  }
+
   for (const note of report.notes ?? []) {
     lines.push('  note: ' + note);
   }

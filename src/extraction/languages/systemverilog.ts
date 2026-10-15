@@ -284,6 +284,42 @@ function connectChains(subroutineCall: SyntaxNode, source: string): { from: stri
   return { from: fromChain, to: toChain };
 }
 
+// -- Struct and union members ---------------------------------------------------
+//
+// A register struct's members are the field names an engineer searches for
+// (`cfg.mode`), and the oracle grades every member declarator. The engine's
+// type-alias path creates only the alias, and nothing visited the members, so
+// they were recorded nowhere. Members become `field` nodes: under the alias for
+// a typedef, and beside the variable for an anonymous struct/union variable.
+
+/** The `data_type` under `holder` when it is a struct or union, else undefined. */
+function structUnionDataType(holder: SyntaxNode): SyntaxNode | undefined {
+  const direct = childrenOfType(holder, 'data_type')[0];
+  const implicit = childrenOfType(holder, 'data_type_or_implicit')[0];
+  const dt = direct ?? (implicit ? childrenOfType(implicit, 'data_type')[0] : undefined);
+  return dt && childrenOfType(dt, 'struct_union').length > 0 ? dt : undefined;
+}
+
+/** One `field` node per member name, nested anonymous members included. */
+function emitStructMembers(dataType: SyntaxNode, ctx: ExtractorContext, depth = 0): void {
+  if (depth > 8) return;
+  for (const member of childrenOfType(dataType, 'struct_union_member')) {
+    const memberType = childrenOfType(member, 'data_type_or_void')[0];
+    const list = childrenOfType(member, 'list_of_variable_decl_assignments')[0];
+    const ids: SyntaxNode[] = [];
+    if (list) {
+      for (const a of childrenOfType(list, 'variable_decl_assignment')) {
+        const id = getChildByField(a, 'name');
+        if (id) ids.push(id);
+      }
+    }
+    const typeText = memberType ? getNodeText(memberType, ctx.source).trim() : '';
+    emitSignalNodes(ids, member, 'field', typeText.split(/[\s[#{]/)[0] || 'var', ctx);
+    const inner = memberType ? structUnionDataType(memberType) : undefined;
+    if (inner) emitStructMembers(inner, ctx, depth + 1);
+  }
+}
+
 /** True when the subtree is an enum typedef, so it becomes an `enum` node not a type alias. */
 function isEnumTypedef(node: SyntaxNode): boolean {
   const queue: SyntaxNode[] = [node];
@@ -448,17 +484,76 @@ function emitSignalNodes(
  *
  * `define / `include / `timescale and macro USES are left alone -- the grammar
  * parses those.
+ *
+ * One shape is WRAPPED instead of blanked: a group that is the whole arm of a
+ * begin/end-less `else`. Keeping both arms there turns `else <a>; <b>;` into
+ * an else arm plus a stray statement in module-item position, and the grammar's
+ * error recovery then folds the module header into an ERROR node. Writing
+ * `begin` over the opening directive and `end` over its `endif keeps both arms
+ * as one block statement, still offset-preserving.
  */
 export function blankVerilogConditionalDirectives(source: string): string {
   if (source.indexOf('`') === -1) return source;
   const blank = (m: string) => ' '.repeat(m.length);
-  return (
-    source
-      // `ifdef FOO / `ifndef FOO / `elsif FOO -- directive plus its macro name.
-      .replace(/^[ \t]*`(?:ifndef|ifdef|elsif)[ \t]+[A-Za-z_]\w*/gm, blank)
-      // `else / `endif take no argument.
-      .replace(/^[ \t]*`(?:else|endif)\b/gm, blank)
-  );
+  const blanked = source
+    // `ifdef FOO / `ifndef FOO / `elsif FOO -- directive plus its macro name.
+    .replace(/^[ \t]*`(?:ifndef|ifdef|elsif)[ \t]+[A-Za-z_]\w*/gm, blank)
+    // `else / `endif take no argument.
+    .replace(/^[ \t]*`(?:else|endif)\b/gm, blank);
+  return wrapElseArmGroups(source, blanked);
+}
+
+/** Opening directive of a group, with its macro name, at the start of a line. */
+const SV_GROUP_OPEN = /^([ \t]*)`(?:ifndef|ifdef)[ \t]+[A-Za-z_]\w*/;
+/** A group's closing `endif at the start of a line. */
+const SV_GROUP_CLOSE = /^([ \t]*)`endif\b/;
+/** Any conditional directive line (open, branch or close). */
+const SV_ANY_DIRECTIVE = /^[ \t]*`(?:ifndef|ifdef|elsif|else|endif)\b/;
+
+/**
+ * Overwrite the opening directive and `endif of every group that is the arm of
+ * a begin/end-less `else` with `begin` / `end` (padded to the same length).
+ *
+ * The test is the previous code line: it ends in the keyword `else` (after an
+ * optional `//` comment). A group in module-item position never follows a bare
+ * `else`, so module items keep the plain blanking; a generate `else` arm is
+ * fine too, because `begin ... end` is a legal generate block.
+ */
+function wrapElseArmGroups(raw: string, blanked: string): string {
+  const rawLines = raw.split('\n');
+  const outLines = blanked.split('\n');
+  const stack: boolean[] = [];
+  let prevCode = '';
+  let changed = false;
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i] ?? '';
+    const open = SV_GROUP_OPEN.exec(line);
+    if (open) {
+      const wrap = /(?:^|[^\w$])else[ \t]*$/.test(prevCode);
+      stack.push(wrap);
+      if (wrap) {
+        const lead = open[1] ?? '';
+        const width = open[0].length - lead.length;
+        outLines[i] = lead + 'begin'.padEnd(width, ' ') + (outLines[i] ?? '').slice(open[0].length);
+        changed = true;
+      }
+      continue;
+    }
+    const close = SV_GROUP_CLOSE.exec(line);
+    if (close) {
+      if (stack.pop()) {
+        const lead = close[1] ?? '';
+        const width = close[0].length - lead.length;
+        outLines[i] = lead + 'end'.padEnd(width, ' ') + (outLines[i] ?? '').slice(close[0].length);
+        changed = true;
+      }
+      continue;
+    }
+    if (SV_ANY_DIRECTIVE.test(line)) continue;
+    const code = line.replace(/\/\/.*$/, '').replace(/\r$/, '').trimEnd();
+    if (code.trim()) prevCode = code;
+  }
+  return changed ? outLines.join('\n') : blanked;
 }
 
 
@@ -615,26 +710,32 @@ function modulePortOrder(moduleDecl: SyntaxNode, source: string): string[] {
   for (let i = 0; i < moduleDecl.namedChildCount; i++) {
     const header = moduleDecl.namedChild(i);
     if (!header) continue;
-
-    if (header.type === 'module_ansi_header') {
-      const list = childrenOfType(header, 'list_of_port_declarations')[0];
-      if (!list) return [];
-      return childrenOfType(list, 'ansi_port_declaration').map((decl) => {
-        const id = getChildByField(decl, 'port_name');
-        return id ? getNodeText(id, source).trim() : '';
-      });
-    }
-
-    if (header.type === 'module_nonansi_header') {
-      const list = childrenOfType(header, 'list_of_ports')[0];
-      if (!list) return [];
-      return childrenOfType(list, 'port').map((port) => {
-        const id = childrenOfType(port, 'simple_identifier')[0];
-        return id ? getNodeText(id, source).trim() : '';
-      });
-    }
+    const ports = headerPortOrder(header, source);
+    if (ports !== undefined) return ports;
   }
   return [];
+}
+
+/** Port order read from one module header; undefined when `header` is not one. */
+function headerPortOrder(header: SyntaxNode, source: string): string[] | undefined {
+  if (header.type === 'module_ansi_header') {
+    const list = childrenOfType(header, 'list_of_port_declarations')[0];
+    if (!list) return [];
+    return childrenOfType(list, 'ansi_port_declaration').map((decl) => {
+      const id = getChildByField(decl, 'port_name');
+      return id ? getNodeText(id, source).trim() : '';
+    });
+  }
+
+  if (header.type === 'module_nonansi_header') {
+    const list = childrenOfType(header, 'list_of_ports')[0];
+    if (!list) return [];
+    return childrenOfType(list, 'port').map((port) => {
+      const id = childrenOfType(port, 'simple_identifier')[0];
+      return id ? getNodeText(id, source).trim() : '';
+    });
+  }
+  return undefined;
 }
 
 /**
@@ -890,6 +991,124 @@ export function clearPendingDirectiveMacros(): void {
 
 // module/program are structural containers we model as 'module'; package -> 'namespace'.
 const MODULE_NODES = new Set(['module_declaration', 'program_declaration']);
+
+/** The module headers error recovery can strand inside a file-level ERROR node. */
+const MODULE_HEADER_NODES: ReadonlySet<string> = new Set(['module_ansi_header', 'module_nonansi_header']);
+
+/**
+ * Publish a module's POSITIONAL port order so a positional instantiation in
+ * another file can resolve its ordinals. Consumed and dropped by the connect
+ * pass; a portless module publishes nothing.
+ */
+function emitPortListMarker(moduleId: string, ports: string[], site: SyntaxNode, ctx: ExtractorContext): void {
+  if (ports.length === 0) return;
+  ctx.addUnresolvedReference({
+    fromNodeId: moduleId,
+    referenceName: `${SV_PORTLIST_PREFIX}${ports.join('|')}`,
+    referenceKind: 'references',
+    line: site.startPosition.row + 1,
+    column: site.startPosition.column,
+  });
+}
+
+// -- Module recovery: a module the grammar could not close --------------------
+//
+// One unparseable statement in a module body (a stray second statement after a
+// begin/end-less `else`, for instance) makes the grammar's error recovery fold
+// everything from the `module` keyword to that statement into ONE file-level
+// ERROR node. No `module_declaration` is ever formed, so the module itself was
+// never indexed, although its ports and signals were (the walk descends into
+// ERROR children) -- they just had no module to belong to.
+//
+// The recovery reads the file's top level as the token stream it is: a module
+// header found directly inside a file-level ERROR opens the module, everything
+// after it -- the rest of that ERROR and the following file-level siblings --
+// is walked inside it, and the next `endmodule` token closes it (often the
+// first token of the NEXT ERROR, which then carries the next module's header).
+// Files without such an ERROR node keep the ordinary walk.
+
+/** True when a file-level ERROR node holds a module header the walk would strand. */
+function hasStrandedModuleHeader(root: SyntaxNode): boolean {
+  for (let i = 0; i < root.childCount; i++) {
+    const c = root.child(i);
+    if (!c || c.type !== 'ERROR') continue;
+    for (let j = 0; j < c.namedChildCount; j++) {
+      const d = c.namedChild(j);
+      if (d && MODULE_HEADER_NODES.has(d.type)) return true;
+    }
+  }
+  return false;
+}
+
+/** File-level declarations that end any recovered module still open before them. */
+const SV_TOP_LEVEL_DECLS: ReadonlySet<string> = new Set([
+  'module_declaration',
+  'program_declaration',
+  'package_declaration',
+  'interface_declaration',
+  'class_declaration',
+]);
+
+function walkWithModuleRecovery(root: SyntaxNode, ctx: ExtractorContext): void {
+  // Flatten one level: the children of a file-level ERROR are items of the
+  // same token stream as the file-level siblings around it.
+  const items: SyntaxNode[] = [];
+  for (let i = 0; i < root.childCount; i++) {
+    const c = root.child(i);
+    if (!c) continue;
+    if (c.type === 'ERROR') {
+      for (let j = 0; j < c.childCount; j++) {
+        const d = c.child(j);
+        if (d) items.push(d);
+      }
+    } else {
+      items.push(c);
+    }
+  }
+
+  let open = false;
+  const close = () => {
+    if (open) ctx.popScope();
+    open = false;
+  };
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]!;
+    if (MODULE_HEADER_NODES.has(it.type)) {
+      close();
+      const name = getChildByField(it, 'name');
+      const text = name ? getNodeText(name, ctx.source).trim() : '';
+      // The module ends at its `endmodule`, or where the next declaration starts.
+      let end: SyntaxNode = it;
+      for (let j = i + 1; j < items.length; j++) {
+        const nx = items[j]!;
+        if (MODULE_HEADER_NODES.has(nx.type) || SV_TOP_LEVEL_DECLS.has(nx.type)) break;
+        end = nx;
+        if (nx.type === 'endmodule') break;
+      }
+      const created = text
+        ? ctx.createNode('module', text, it, {
+            endLine: end.endPosition.row + 1,
+            endColumn: end.endPosition.column,
+          })
+        : null;
+      if (created) {
+        ctx.pushScope(created.id);
+        open = true;
+        emitPortListMarker(created.id, headerPortOrder(it, ctx.source) ?? [], it, ctx);
+      }
+      ctx.visitNode(it); // the ANSI port list lives in the header
+      continue;
+    }
+    if (it.type === 'endmodule') {
+      close();
+      continue;
+    }
+    if (!it.isNamed) continue;
+    if (SV_TOP_LEVEL_DECLS.has(it.type)) close();
+    ctx.visitNode(it);
+  }
+  close();
+}
 
 // -- Subroutine bodies: the dataflow inside a task or function ----------------
 //
@@ -1212,6 +1431,12 @@ export const systemverilogExtractor: LanguageExtractor = {
           });
         }
       }
+      // A module whose body the grammar could not close: walk the top level as
+      // a token stream so the module is still created (see walkWithModuleRecovery).
+      if (hasStrandedModuleHeader(node)) {
+        walkWithModuleRecovery(node, ctx);
+        return true;
+      }
       return false; // keep walking: the file's real contents follow
     }
 
@@ -1314,6 +1539,29 @@ export const systemverilogExtractor: LanguageExtractor = {
       return false; // keep walking: a select's index is its own subtree
     }
 
+    // Struct/union typedefs: the alias, then one field per member under it.
+    // Checked before the enum branch, which matches any subtree holding an enum.
+    if (t === 'type_declaration') {
+      const dt = structUnionDataType(node);
+      if (dt) {
+        const name = svName(node, ctx.source);
+        if (!name) return false;
+        const alias = ctx.createNode('type_alias', name, node);
+        if (alias) {
+          ctx.pushScope(alias.id);
+          emitStructMembers(dt, ctx);
+          ctx.popScope();
+        }
+        // The engine walks a type alias's children after creating it (a packed
+        // dimension can read a parameter); keep doing that.
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child) ctx.visitNode(child);
+        }
+        return true;
+      }
+    }
+
     // Enum typedefs: the engine's type-alias path can't emit enum members (it
     // looks for enumTypes, which SV leaves empty), so build the enum + members here.
     if (t === 'type_declaration' && isEnumTypedef(node)) {
@@ -1378,16 +1626,7 @@ export const systemverilogExtractor: LanguageExtractor = {
       // instantiation in another file can resolve its ordinals. Consumed and
       // dropped by the connect pass; a portless module publishes nothing.
       if (MODULE_NODES.has(t)) {
-        const ports = modulePortOrder(node, ctx.source);
-        if (ports.length > 0) {
-          ctx.addUnresolvedReference({
-            fromNodeId: created.id,
-            referenceName: `${SV_PORTLIST_PREFIX}${ports.join('|')}`,
-            referenceKind: 'references',
-            line: node.startPosition.row + 1,
-            column: node.startPosition.column,
-          });
-        }
+        emitPortListMarker(created.id, modulePortOrder(node, ctx.source), node, ctx);
       }
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
@@ -1530,6 +1769,10 @@ export const systemverilogExtractor: LanguageExtractor = {
         }
       }
       emitSignalNodes(ids, node, 'field', svDataKindOf(node, ctx.source), ctx);
+      // `struct packed { logic a; } v;` -- the members of an anonymous struct
+      // variable sit beside the variable in the enclosing scope.
+      const anon = structUnionDataType(node);
+      if (anon) emitStructMembers(anon, ctx);
       return false;
     }
 

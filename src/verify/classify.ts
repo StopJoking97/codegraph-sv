@@ -29,6 +29,13 @@ export interface GradedFile {
   scope: string[];
   /** Names inside a subroutine or procedural block — excluded by design. */
   local: string[];
+  /**
+   * The file is a statement list meant to be `include-d inside a procedural
+   * block, not a compilation unit. The two parsers recover from it differently,
+   * so it is graded loosely: no MISSING and no UNEXPLAINED, and the report
+   * lists it so the loosening is visible.
+   */
+  fragment?: boolean;
 }
 
 /** A half-open line range `[start, end]`, 1-based and inclusive. */
@@ -130,6 +137,7 @@ export function classifyFile(
   indexed: IndexedFile,
   regions: readonly LineRange[]
 ): FileVerdict {
+  if (graded.fragment === true) return { file, graded: 0, hit: 0, disagreements: [] };
   const scope = new Set(graded.scope);
   const local = new Set(graded.local);
   const disagreements: Disagreement[] = [];

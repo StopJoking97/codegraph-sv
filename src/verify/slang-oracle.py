@@ -100,7 +100,65 @@ LOCAL_SCOPES = {
     "SyntaxKind.FinalBlock",
     "SyntaxKind.ForLoopStatement",
     "SyntaxKind.ForeachLoopStatement",
+    # The formals of `covergroup cg with function sample(int a, ...)` are local
+    # to the covergroup; the index does not carry them, as for any subroutine.
+    "SyntaxKind.CovergroupDeclaration",
 }
+
+# -- Statement fragments ------------------------------------------------------
+#
+# A file holding a bare statement list is meant to be `include-d inside a
+# procedural block; standalone it is not a compilation unit, and slang and the
+# index recover from it differently (slang reads a procedural `for` as a
+# generate loop and promotes its locals to design scope, and skips a
+# `fork ... join` region as bad tokens). Such a file is reported as a FRAGMENT
+# and graded loosely, visibly. Three tests, all required:
+#   1. the compilation unit holds no declaration container,
+#   2. slang reported a member-level complaint (NotAllowedInCU / ExpectedMember),
+#   3. the same text wrapped in `initial begin ... end` parses with strictly
+#      fewer errors -- it reads as statements. A header of module items (`wire`,
+#      `assign`) parses WORSE when wrapped, so it stays strictly graded.
+CONTAINER_KINDS = {
+    "SyntaxKind.ModuleDeclaration",
+    "SyntaxKind.PackageDeclaration",
+    "SyntaxKind.InterfaceDeclaration",
+    "SyntaxKind.ProgramDeclaration",
+    "SyntaxKind.ClassDeclaration",
+    "SyntaxKind.CheckerDeclaration",
+}
+FRAGMENT_DIAGS = {"NotAllowedInCU", "ExpectedMember"}
+FRAGMENT_WRAP_HEAD = "module __codegraph_fragment__; initial begin\n"
+FRAGMENT_WRAP_TAIL = "\nend endmodule\n"
+
+
+def error_codes(tree):
+    """Short names of the error-severity diagnostics of a tree."""
+    out = []
+    for d in getattr(tree, "diagnostics", []) or []:
+        try:
+            if not d.isError():
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        code = str(getattr(d, "code", ""))
+        # "DiagCode(NotAllowedInCU)" -> "NotAllowedInCU"
+        if code.startswith("DiagCode(") and code.endswith(")"):
+            code = code[len("DiagCode("):-1]
+        out.append(code)
+    return out
+
+
+def name_of(node):
+    """The declared identifier, whether `name` is a Token or a SyntaxNode."""
+    raw = getattr(node, "name", None)
+    if raw is None:
+        return None
+    text = getattr(raw, "valueText", None)
+    if text:
+        return text
+    # FunctionPrototype hands back an IdentifierName node.
+    text = str(raw).strip()
+    return text or None
 
 
 def fail(code, message):
@@ -247,6 +305,7 @@ def main():
     # names are discovered while parsing whatever includes it, and again when
     # the header is parsed in its own right.
     buckets = {}
+    fragments = set()
     parse_failed = []
     not_on_disk = []
     foreign_dropped = 0
@@ -257,6 +316,45 @@ def main():
             b = {"scope": set(), "local": set()}
             store[rel] = b
         return b
+
+    def fragment_locals(tree, abspath, sm):
+        """The declared names of a statement fragment, or None when the file is not one."""
+        try:
+            members = list(getattr(tree.root, "members", []) or [])
+        except Exception:  # noqa: BLE001
+            return None
+        if any(str(getattr(m, "kind", "")) in CONTAINER_KINDS for m in members):
+            return None
+        standalone = error_codes(tree)
+        if not FRAGMENT_DIAGS.intersection(standalone):
+            return None
+        try:
+            with open(abspath, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            wrapped_text = FRAGMENT_WRAP_HEAD + text + FRAGMENT_WRAP_TAIL
+            if sm is not None:
+                wrapped = SyntaxTree.fromText(wrapped_text, sm, "fragment", "")
+            else:
+                wrapped = SyntaxTree.fromText(wrapped_text, "fragment")
+        except Exception:  # noqa: BLE001
+            return None
+        if len(error_codes(wrapped)) >= len(standalone):
+            return None
+        names = set()
+
+        def collect(node):
+            kind = str(getattr(node, "kind", ""))
+            if kind not in DECL_KINDS and kind not in HEADER_KINDS:
+                return
+            name = name_of(node)
+            if name and name != "__codegraph_fragment__":
+                names.add(name)
+
+        try:
+            wrapped.root.visit(collect)
+        except Exception:  # noqa: BLE001
+            return None
+        return names
 
     for rel in files:
         abspath = os.path.join(root, rel.replace("/", os.sep))
@@ -279,6 +377,14 @@ def main():
         # a manager to route them; the tree carries the one it used.
         tree_sm = source_manager if source_manager is not None else getattr(tree, "sourceManager", None)
 
+        fragment_names = fragment_locals(tree, abspath, source_manager)
+        if fragment_names is not None:
+            # Graded loosely: no design-scope name, its declarations reported as
+            # the locals they are in the block the file is included into.
+            fragments.add(rel)
+            bucket_in(buckets, rel)["local"] |= fragment_names
+            continue
+
         # Staged per parse and merged only on success, so a walk that throws
         # partway leaves the report exactly as a failed parse always did.
         pending = {}
@@ -296,18 +402,6 @@ def main():
                     return True
                 parent = getattr(parent, "parent", None)
             return False
-
-        def name_of(node):
-            """The declared identifier, whether `name` is a Token or a SyntaxNode."""
-            raw = getattr(node, "name", None)
-            if raw is None:
-                return None
-            text = getattr(raw, "valueText", None)
-            if text:
-                return text
-            # FunctionPrototype hands back an IdentifierName node.
-            text = str(raw).strip()
-            return text or None
 
         def visit(node, _rel=rel, _sm=tree_sm, _p=pending, _pf=pending_foreign):
             kind = str(getattr(node, "kind", ""))
@@ -345,10 +439,14 @@ def main():
         # as it did before routing existed.
         bucket_in(buckets, rel)
 
-    out_files = {
-        rel: {"scope": sorted(b["scope"]), "local": sorted(b["local"])}
-        for rel, b in buckets.items()
-    }
+    out_files = {}
+    for rel, b in buckets.items():
+        if rel in fragments:
+            # Names other files' parses attributed here are dropped with the
+            # rest: a fragment is not graded name by name.
+            out_files[rel] = {"scope": [], "local": sorted(b["local"]), "fragment": True}
+        else:
+            out_files[rel] = {"scope": sorted(b["scope"]), "local": sorted(b["local"])}
     if foreign_dropped:
         notes.append(
             "%d declaration(s) are declared in files outside the graded set (unscoped or "
