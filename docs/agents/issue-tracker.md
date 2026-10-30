@@ -1,6 +1,6 @@
 # Issue tracker: GitHub (draft-first)
 
-Issues and specs for this repo live in **`StopJoking97/codegraph-sv`** (private). Every ticket is
+Issues and specs for this repo live in **`StopJoking97/codegraph-sv`**. Every ticket is
 DRAFTED locally under `.scratch/` and published only after the user reviews it.
 
 ## ⚠️ Always pass `--repo` explicitly
